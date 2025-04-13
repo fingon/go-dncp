@@ -6,6 +6,8 @@ import (
 	"math/rand/v2"
 	"sync"
 	"time"
+
+	"github.com/fingon/go-dncp/timeish" // Import the new package
 )
 
 // Constants defining default Trickle parameters, based on RFC 6206 examples
@@ -39,10 +41,10 @@ type Trickle[M any] struct {
 	transmitFunc    TransmitFunc       // Callback function for transmissions
 	consistencyFunc ConsistencyFunc[M] // Callback function to check consistency
 	logger          *slog.Logger
-	clock           Clock // Interface for time operations
+	clock           timeish.Clock // Use timeish.Clock
 
-	intervalTimer     Timer // Timer for the end of the current interval I
-	transmissionTimer Timer // Timer for the transmission time t within the interval
+	intervalTimer     timeish.Timer // Use timeish.Timer
+	transmissionTimer timeish.Timer // Use timeish.Timer
 
 	// --- Communication Channels ---
 	eventChan   chan struct{} // Channel to signal an external event causing a reset
@@ -90,7 +92,7 @@ type Config[M any] struct {
 	// RandSource is the source for random numbers. If nil, a new PCG source is used.
 	RandSource rand.Source
 	// Clock provides the time source. If nil, uses the real time.
-	Clock Clock
+	Clock timeish.Clock // Use timeish.Clock
 }
 
 // New creates a new Trickle instance for messages of type M.
@@ -123,7 +125,7 @@ func New[M any](config Config[M]) (*Trickle[M], error) {
 		config.Logger = slog.Default()
 	}
 	if config.Clock == nil {
-		config.Clock = &realClock{} // Use real time if no clock is provided
+		config.Clock = timeish.NewRealClock() // Use real time from timeish
 	}
 	if config.RandSource == nil {
 		// Use a default source if none provided.
