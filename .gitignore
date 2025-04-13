@@ -1,5 +1,13 @@
+# Backups
+*.bak
+*.bck.yaml
+*.orig
+*~
+.#*
+.DS_Store
+\#*\#
+
 .aider.chat.history.md
 .aider.input.history
 .aider.tags.*
 reference/
-
