@@ -3,9 +3,11 @@ SHSP2
 This is the DNCP profile of SHSP2, an experimental home automation
 protocol.
 
-   o Multicast transport: IPv6 UDP on port 53923 to link-local scoped multicast address ff02::1:0:42. Each multicast should contain new TLV 768, which contains HTTP port to send requests to.
+   o New TLV: type 768, URL. It is variable length string contain URL that can be used to reach the node (usually http:// prefixed but it could be also e.g. https). The /shsp2 endpoint is used with POST requests to send binary DNCP TLV sequences, as well as receive them in the body (if any response is produced). The unicast should use only IPv4 addresses.
 
-   o Unicast transport: IPv6 link local only HTTP request to source port identified in UDP multicast payloads.
+   o Multicast transport: IPv6 UDP on port 53923 to link-local scoped multicast address ff02::1:0:42. Each multicast should contain new TLV 768, which contains HTTP URL to send requests to.
+
+   o Unicast transport: IPv4 address only HTTP request to the URL identified in UDP multicast payloads.
 
    o Security: None. (upper layers care about security)
 

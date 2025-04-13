@@ -177,6 +177,11 @@ type DNCP struct {
 	RemovePeerFunc func(localEndpointID EndpointIdentifier, peerNodeID NodeIdentifier) error
 }
 
+// GetNodeID returns the node identifier of this DNCP instance.
+func (d *DNCP) GetNodeID() NodeIdentifier {
+	return slices.Clone(d.nodeID)
+}
+
 // New creates a new DNCP instance.
 func New(nodeID NodeIdentifier, profile Profile) (*DNCP, error) {
 	// --- Validate and Default Profile ---
@@ -262,6 +267,30 @@ func (d *DNCP) Stop() {
 	close(d.stopChan)
 	d.wg.Wait()
 	d.logger.Info("DNCP instance stopped")
+}
+
+// GetNodeData returns the NodeData for a specific node.
+// This provides access to the TLVs published by the node.
+func (d *DNCP) GetNodeData(nodeID NodeIdentifier) (NodeData, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	node, exists := d.nodes[string(nodeID)]
+	if !exists {
+		return nil, fmt.Errorf("node %x not found in DNCP network", nodeID)
+	}
+
+	if !node.isReachable {
+		return nil, fmt.Errorf("node %x is not reachable", nodeID)
+	}
+
+	// Return a deep copy of the node data to prevent modification
+	dataCopy := make(NodeData, len(node.Data))
+	for typ, tlvSlice := range node.Data {
+		dataCopy[typ] = slices.Clone(tlvSlice)
+	}
+
+	return dataCopy, nil
 }
 
 // runBackgroundTasks handles periodic tasks like keep-alives and topology updates.
