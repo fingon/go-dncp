@@ -1,3 +1,6 @@
+// This would be named dncp_test.go, except I don't want wildcards to
+// include it in AI context.
+
 package dncp_test
 
 import (
