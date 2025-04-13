@@ -17,6 +17,32 @@ import (
 	"github.com/fingon/go-dncp/trickle"
 )
 
+// TransportMode represents the communication mode for an endpoint.
+type TransportMode int
+
+const (
+	// TransportModeUnicast represents pure unicast communication.
+	TransportModeUnicast TransportMode = iota
+	// TransportModeMulticastUnicast represents both multicast and unicast communication.
+	TransportModeMulticastUnicast
+	// TransportModeMulticastListenUnicast represents multicast listening with unicast communication.
+	TransportModeMulticastListenUnicast
+)
+
+// String returns a string representation of the TransportMode.
+func (m TransportMode) String() string {
+	switch m {
+	case TransportModeUnicast:
+		return "Unicast"
+	case TransportModeMulticastUnicast:
+		return "Multicast+Unicast"
+	case TransportModeMulticastListenUnicast:
+		return "MulticastListen+Unicast"
+	default:
+		return fmt.Sprintf("Unknown(%d)", int(m))
+	}
+}
+
 // NodeIdentifier represents a unique identifier for a DNCP node.
 // Its length is defined by the DNCP profile.
 type NodeIdentifier []byte
@@ -57,12 +83,22 @@ type Profile struct {
 	KeepAliveMultiplier uint
 	// UseDenseOptimization specifies if the dense multicast optimization (Sec 6.2) is enabled.
 	UseDenseOptimization bool
+	// DensePeerThreshold is the number of peers on a multicast link above which
+	// the dense optimization logic is triggered. Only used if UseDenseOptimization is true.
+	// A value of 0 disables the threshold check.
+	DensePeerThreshold uint
 	// Logger is the logger to use. If nil, slog.Default() is used.
 	Logger *slog.Logger
 	// Clock provides the time source. If nil, uses real time.
 	Clock timeish.Clock // Use timeish.Clock
 	// RandSource provides the random number source. If nil, a default is used.
 	RandSource *uint64 // Pointer to allow sharing if needed, or nil for default
+
+	// NewTrickleInstanceFunc creates a Trickle instance for an endpoint or peer.
+	// The implementation should configure the TransmitFunc and ConsistencyFunc
+	// based on the provided context (e.g., destination address).
+	// The returned Trickle instance should *not* be started yet.
+	NewTrickleInstanceFunc func(transmitFunc trickle.TransmitFunc, consistencyFunc trickle.ConsistencyFunc[[]byte]) (*trickle.Trickle[[]byte], error)
 }
 
 // NodeData represents the set of TLVs published by a node.
@@ -89,25 +125,26 @@ type NodeState struct {
 // RFC 7787 Section 2 & 5.
 type Peer struct {
 	NodeID            NodeIdentifier
-	EndpointID        EndpointIdentifier    // The peer's endpoint ID
-	LocalEndpointID   EndpointIdentifier    // The local endpoint ID for this peer relationship
-	Address           string                // Transport address (e.g., "ip:port"), managed externally
-	LastContact       time.Time             // Last time any valid message was received
-	KeepAliveInterval time.Duration         // Peer's advertised keep-alive interval (0 if none/default)
-	trickleInstance   *trickle.Trickle[any] // Trickle state for unreliable unicast (if applicable)
+	EndpointID        EndpointIdentifier       // The peer's endpoint ID
+	LocalEndpointID   EndpointIdentifier       // The local endpoint ID for this peer relationship
+	Address           string                   // Transport address (e.g., "ip:port"), managed externally
+	LastContact       time.Time                // Last time any valid message was received
+	KeepAliveInterval time.Duration            // Peer's advertised keep-alive interval (0 if none/default)
+	trickleInstance   *trickle.Trickle[[]byte] // Trickle state for unreliable unicast (if applicable)
 }
 
 // Endpoint represents a local DNCP communication endpoint.
 // RFC 7787 Section 2 & 5.
 type Endpoint struct {
-	ID                EndpointIdentifier
-	TransportMode     string                // e.g., "Multicast+Unicast", "Unicast", "MulticastListen+Unicast"
-	InterfaceName     string                // e.g., "eth0"
-	LocalAddress      string                // Local address used by the endpoint
-	MulticastAddress  string                // Multicast address (if applicable)
-	trickleInstance   *trickle.Trickle[any] // Trickle state for multicast/endpoint
-	peers             map[string]*Peer      // Peers discovered/configured on this endpoint, keyed by string(NodeID)
-	keepAliveInterval time.Duration         // Local keep-alive interval for this endpoint
+	ID            EndpointIdentifier
+	TransportMode TransportMode // Communication mode for this endpoint
+
+	InterfaceName     string                   // e.g., "eth0"
+	LocalAddress      string                   // Local address used by the endpoint
+	MulticastAddress  string                   // Multicast address (if applicable)
+	trickleInstance   *trickle.Trickle[[]byte] // Trickle state for multicast/endpoint
+	peers             map[string]*Peer         // Peers discovered/configured on this endpoint, keyed by string(NodeID)
+	highestNodeOnLink NodeIdentifier           // Node ID of the highest peer seen on this link (for dense mode)
 }
 
 // DNCP represents a single DNCP node instance.
@@ -298,59 +335,6 @@ func (d *DNCP) PublishData(newData NodeData) error {
 	return nil
 }
 
-// AddEndpoint configures a new local endpoint.
-func (d *DNCP) AddEndpoint(ep Endpoint) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if _, exists := d.endpoints[ep.ID]; exists {
-		return fmt.Errorf("endpoint with ID %d already exists", ep.ID)
-	}
-	if ep.ID == ReservedEndpointIdentifier {
-		return errors.New("cannot use reserved endpoint identifier 0")
-	}
-	if ep.peers == nil {
-		ep.peers = make(map[string]*Peer)
-	}
-	// TODO: Initialize Trickle instance based on TransportMode
-
-	d.endpoints[ep.ID] = &ep
-	d.logger.Info("Added endpoint", "id", ep.ID, "mode", ep.TransportMode, "iface", ep.InterfaceName)
-	return nil
-}
-
-// RemoveEndpoint removes a local endpoint.
-func (d *DNCP) RemoveEndpoint(id EndpointIdentifier) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	_, exists := d.endpoints[id] // Use blank identifier as ep is not used below
-	if !exists {
-		return fmt.Errorf("endpoint with ID %d not found", id)
-	}
-
-	// TODO: Stop Trickle instance for the endpoint
-	// TODO: Clean up peers associated with this endpoint? Or rely on timeout/transport signals?
-
-	delete(d.endpoints, id)
-	d.logger.Info("Removed endpoint", "id", id)
-
-	// Update local Peer TLVs and republish if necessary
-	if d.removeLocalPeerTLVsForEndpoint(id) {
-		d.mu.Unlock() // Unlock before calling PublishData which locks
-		// Need to reconstruct the current local data without the removed peers
-		currentData := d.getLocalDataForPublishing()
-		err := d.PublishData(currentData)
-		d.mu.Lock() // Re-lock
-		if err != nil {
-			d.logger.Error("Failed to republish data after removing endpoint", "id", id, "err", err)
-			// State might be inconsistent here
-		}
-	}
-
-	return nil
-}
-
 // --- Topology & Reachability (RFC 7787 Section 4.6) ---
 
 // updateTopologyGraph recalculates node reachability based on published Peer TLVs.
@@ -402,19 +386,6 @@ func (d *DNCP) updateTopologyGraph() bool {
 			node.publishedPeers[peerTLV.LocalEndpointID][string(peerTLV.PeerNodeID)] = peerTLV.PeerEndpointID
 		}
 	}
-	// NOTE: The duplicated block below was removed as part of the fix for the NodeData map change.
-	// This section seems to be a leftover artifact. Removing the extra closing brace below.
-	//				continue
-	//			}
-	//			if _, ok := node.publishedPeers[peerTLV.LocalEndpointID]; !ok {
-	//				node.publishedPeers[peerTLV.LocalEndpointID] = make(map[string]EndpointIdentifier)
-	//			}
-	//			// Use string conversion for the map key
-	//			node.publishedPeers[peerTLV.LocalEndpointID][string(peerTLV.PeerNodeID)] = peerTLV.PeerEndpointID
-	//		}
-	//	}
-	//}
-
 	// Iteratively mark nodes as reachable
 	madeProgress := true
 	for madeProgress {
@@ -488,151 +459,6 @@ func (d *DNCP) updateTopologyGraph() bool {
 	return changed
 } // Restore closing brace for updateTopologyGraph
 
-// --- Peer Management & Keep-Alives ---
-
-// AddOrUpdatePeer adds a new peer or updates an existing one on a local endpoint.
-// Called by the transport layer when a connection is established or a NodeEndpoint TLV is received.
-func (d *DNCP) AddOrUpdatePeer(localEpID EndpointIdentifier, peerNodeID NodeIdentifier, peerEpID EndpointIdentifier, peerAddr string) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	ep, ok := d.endpoints[localEpID]
-	if !ok {
-		return fmt.Errorf("local endpoint %d not found", localEpID)
-	}
-
-	peer, exists := ep.peers[string(peerNodeID)]
-	now := d.clock.Now()
-
-	if !exists {
-		peer = &Peer{
-			NodeID:          slices.Clone(peerNodeID),
-			EndpointID:      peerEpID,
-			LocalEndpointID: localEpID,
-			Address:         peerAddr,
-			LastContact:     now,
-			// KeepAliveInterval will be updated when NodeState is received
-		}
-		ep.peers[string(peerNodeID)] = peer
-		d.logger.Info("Added new peer", "localEpID", localEpID, "peerNodeID", fmt.Sprintf("%x", peerNodeID), "peerEpID", peerEpID, "addr", peerAddr)
-	} else {
-		// Update existing peer info
-		peer.EndpointID = peerEpID // Peer might change its endpoint ID?
-		peer.Address = peerAddr
-		peer.LastContact = now
-		d.logger.Debug("Updated existing peer contact", "localEpID", localEpID, "peerNodeID", fmt.Sprintf("%x", peerNodeID))
-	}
-
-	// Update local Peer TLV for this new/updated peer relationship
-	if d.addLocalPeerTLV(localEpID, peerNodeID, peerEpID) {
-		d.mu.Unlock() // Unlock before calling PublishData
-		// Need to reconstruct the current local data with the new peer
-		currentData := d.getLocalDataForPublishing()
-		err := d.PublishData(currentData)
-		d.mu.Lock() // Re-lock
-		if err != nil {
-			d.logger.Error("Failed to republish data after adding/updating peer", "localEpID", localEpID, "peerNodeID", fmt.Sprintf("%x", peerNodeID), "err", err)
-			// State might be inconsistent here
-		}
-	}
-
-	return nil
-}
-
-// RemovePeer removes a peer relationship.
-// Called by transport layer on disconnect or by keep-alive timeout.
-func (d *DNCP) RemovePeer(localEpID EndpointIdentifier, peerNodeID NodeIdentifier) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	ep, ok := d.endpoints[localEpID]
-	if !ok {
-		// Endpoint might have been removed already, not an error
-		d.logger.Warn("Cannot remove peer, local endpoint not found", "localEpID", localEpID, "peerNodeID", fmt.Sprintf("%x", peerNodeID))
-		return nil // Or return specific error? fmt.Errorf("local endpoint %d not found", localEpID)
-	}
-
-	peerKey := string(peerNodeID)
-	peer, exists := ep.peers[peerKey]
-	if !exists {
-		// Peer might have been removed already, not an error
-		d.logger.Warn("Cannot remove peer, peer not found on endpoint", "localEpID", localEpID, "peerNodeID", fmt.Sprintf("%x", peerNodeID))
-		return nil
-	}
-
-	// TODO: Stop per-peer Trickle instance if applicable
-
-	delete(ep.peers, peerKey)
-	d.logger.Info("Removed peer", "localEpID", localEpID, "peerNodeID", fmt.Sprintf("%x", peerNodeID))
-
-	// Remove the corresponding Peer TLV from local data and republish
-	if d.removeLocalPeerTLV(localEpID, peerNodeID, peer.EndpointID) {
-		d.mu.Unlock() // Unlock before calling PublishData
-		// Need to reconstruct the current local data without the removed peer
-		currentData := d.getLocalDataForPublishing()
-		err := d.PublishData(currentData)
-		d.mu.Lock() // Re-lock
-		if err != nil {
-			d.logger.Error("Failed to republish data after removing peer", "localEpID", localEpID, "peerNodeID", fmt.Sprintf("%x", peerNodeID), "err", err)
-			// State might be inconsistent here
-		}
-	}
-
-	return nil
-}
-
-// checkPeerTimeouts iterates through peers and removes those that haven't been heard from.
-// Assumes lock is held.
-func (d *DNCP) checkPeerTimeouts() {
-	now := d.clock.Now()
-	peersToRemove := make(map[EndpointIdentifier][]NodeIdentifier) // localEpID -> list of peerNodeIDs
-
-	for localEpID, ep := range d.endpoints {
-		for _, peer := range ep.peers {
-			keepAliveInterval := d.profile.KeepAliveInterval // Use profile default initially
-
-			// Check if peer publishes a specific interval
-			// TODO: When NodeData supports multiple TLVs, decode KeepAliveInterval TLV here
-			//       and check if it applies to this peerLocalEpID or default (0).
-			//       This check is currently done within updatePeerKeepAliveFromNodeData.
-
-			// Use peer's specific interval if found and non-zero, else use local endpoint default
-			// (Currently, peer.KeepAliveInterval is updated in updatePeerKeepAliveFromNodeData)
-			if peer.KeepAliveInterval > 0 {
-				keepAliveInterval = peer.KeepAliveInterval
-			} else if ep.keepAliveInterval > 0 {
-				keepAliveInterval = ep.keepAliveInterval
-			}
-
-			if keepAliveInterval > 0 { // Only timeout if keep-alives are expected
-				timeoutDuration := time.Duration(d.profile.KeepAliveMultiplier) * keepAliveInterval
-				if now.Sub(peer.LastContact) > timeoutDuration {
-					d.logger.Info("Peer timed out", "localEpID", localEpID, "peerNodeID", fmt.Sprintf("%x", peer.NodeID), "lastContact", peer.LastContact, "timeout", timeoutDuration)
-					if _, ok := peersToRemove[localEpID]; !ok {
-						peersToRemove[localEpID] = make([]NodeIdentifier, 0, 1)
-					}
-					peersToRemove[localEpID] = append(peersToRemove[localEpID], peer.NodeID)
-				}
-			}
-		}
-	}
-
-	// Remove timed-out peers (unlocks/relocks internally via RemovePeer)
-	if len(peersToRemove) > 0 {
-		d.mu.Unlock() // Need to unlock before calling RemovePeer which locks
-		for localEpID, nodeIDs := range peersToRemove {
-			for _, peerNodeID := range nodeIDs {
-				// RemovePeer handles logging and republishing
-				if err := d.RemovePeer(localEpID, peerNodeID); err != nil {
-					// Log error but continue trying to remove others
-					d.logger.Error("Failed to remove timed-out peer", "localEpID", localEpID, "peerNodeID", fmt.Sprintf("%x", peerNodeID), "err", err)
-				}
-			}
-		}
-		d.mu.Lock() // Re-lock after processing removals
-	}
-}
-
 // --- Local Data Management ---
 
 // getLocalDataForPublishing constructs the NodeData map for the local node,
@@ -652,8 +478,16 @@ func (d *DNCP) getLocalDataForPublishing() NodeData {
 	peerTLVs := make([]*TLV, 0) // Collect all peer TLVs first
 	for localEpID, ep := range d.endpoints {
 		for _, peer := range ep.peers {
-			// TODO: Apply dense optimization filtering here if ep.isDense
-			// if ep.isDense && !bytes.Equal(peer.NodeID, ep.highestNodeOnLink) { continue }
+			// Apply dense optimization filtering (RFC 7787 Section 6.2)
+			// If this node is listening on a dense link, only publish the peer with the highest ID.
+			if d.profile.UseDenseOptimization && ep.TransportMode == TransportModeMulticastListenUnicast {
+				// highestNodeOnLink needs to be determined and set elsewhere based on received messages.
+				if ep.highestNodeOnLink == nil || !bytes.Equal(peer.NodeID, ep.highestNodeOnLink) {
+					d.logger.Debug("Dense optimization: Skipping peer TLV publication", "localEpID", localEpID, "peerNodeID", fmt.Sprintf("%x", peer.NodeID))
+					continue // Skip publishing Peer TLV for this peer
+				}
+				d.logger.Debug("Dense optimization: Publishing peer TLV for highest node", "localEpID", localEpID, "peerNodeID", fmt.Sprintf("%x", peer.NodeID))
+			}
 
 			peerTLV, err := NewPeerTLV(peer.NodeID, peer.EndpointID, localEpID, d.profile.NodeIdentifierLength)
 			if err != nil {
@@ -667,7 +501,7 @@ func (d *DNCP) getLocalDataForPublishing() NodeData {
 		localData[TLVTypePeer] = peerTLVs
 	}
 
-	// Add KeepAlive TLVs if needed
+	// Add KeepAlive TLVs if needed (profile default is probably good enough for now)
 	// TODO: Implement KeepAlive TLV creation based on endpoint config
 
 	return localData
@@ -781,6 +615,278 @@ func (d *DNCP) removeLocalPeerTLVsForEndpoint(localEpID EndpointIdentifier) bool
 	return false // No TLVs removed for this endpoint
 }
 
+// --- Trickle Integration Helpers ---
+
+// requiresEndpointTrickle checks if the transport mode needs an endpoint-wide Trickle instance.
+func requiresEndpointTrickle(mode TransportMode) bool {
+	// Only Multicast+Unicast mode uses endpoint Trickle for multicast status updates
+	return mode == TransportModeMulticastUnicast
+}
+
+// requiresPeerTrickle checks if the transport mode needs per-peer Trickle instances.
+func requiresPeerTrickle(mode TransportMode) bool {
+	// Only Unicast mode with unreliable transport needs per-peer Trickle
+	// Assuming "Unicast" implies unreliable for this example. Profile needs to be clearer.
+	return mode == TransportModeUnicast
+}
+
+// createEndpointTransmitFunc creates the TransmitFunc for an endpoint's Trickle instance.
+func (d *DNCP) createEndpointTransmitFunc(ep *Endpoint) trickle.TransmitFunc {
+	return func() {
+		d.mu.RLock()
+		// Include NodeEndpoint TLV before NetworkState TLV (Sec 4.2)
+		nodeEpTLV, err := NewNodeEndpointTLV(d.nodeID, ep.ID, d.profile.NodeIdentifierLength)
+		if err != nil {
+			d.logger.Error("Failed to create NodeEndpoint TLV for Trickle transmit", "epID", ep.ID, "err", err)
+			d.mu.RUnlock()
+			return
+		}
+		netStateTLV, err := NewNetworkStateTLV(d.networkStateHash, d.profile.HashLength)
+		if err != nil {
+			d.logger.Error("Failed to create NetworkState TLV for Trickle transmit", "epID", ep.ID, "err", err)
+			d.mu.RUnlock()
+			return
+		}
+		d.mu.RUnlock() // Unlock before sending
+
+		// Destination for endpoint Trickle is usually multicast address
+		dest := ep.MulticastAddress // Assuming this field holds the correct destination string
+		if dest == "" {
+			d.logger.Warn("Cannot transmit endpoint Trickle, no multicast address configured", "epID", ep.ID)
+			return
+		}
+
+		err = d.sendTLVs(dest, []*TLV{nodeEpTLV, netStateTLV})
+		if err != nil {
+			d.logger.Error("Failed Trickle transmission for endpoint", "epID", ep.ID, "dest", dest, "err", err)
+		} else {
+			d.logger.Debug("Sent Trickle update for endpoint", "epID", ep.ID, "dest", dest)
+		}
+	}
+}
+
+// createPeerTransmitFunc creates the TransmitFunc for a peer's Trickle instance.
+func (d *DNCP) createPeerTransmitFunc(peer *Peer) trickle.TransmitFunc {
+	return func() {
+		d.mu.RLock()
+		// Include NodeEndpoint TLV before NetworkState TLV (Sec 4.2)
+		nodeEpTLV, err := NewNodeEndpointTLV(d.nodeID, peer.LocalEndpointID, d.profile.NodeIdentifierLength)
+		if err != nil {
+			d.logger.Error("Failed to create NodeEndpoint TLV for peer Trickle transmit", "peerNodeID", fmt.Sprintf("%x", peer.NodeID), "err", err)
+			d.mu.RUnlock()
+			return
+		}
+		netStateTLV, err := NewNetworkStateTLV(d.networkStateHash, d.profile.HashLength)
+		if err != nil {
+			d.logger.Error("Failed to create NetworkState TLV for peer Trickle transmit", "peerNodeID", fmt.Sprintf("%x", peer.NodeID), "err", err)
+			d.mu.RUnlock()
+			return
+		}
+		d.mu.RUnlock() // Unlock before sending
+
+		dest := peer.Address // Destination for peer Trickle is the peer's unicast address
+		if dest == "" {
+			d.logger.Warn("Cannot transmit peer Trickle, no peer address known", "peerNodeID", fmt.Sprintf("%x", peer.NodeID))
+			return
+		}
+
+		err = d.sendTLVs(dest, []*TLV{nodeEpTLV, netStateTLV})
+		if err != nil {
+			d.logger.Error("Failed Trickle transmission for peer", "peerNodeID", fmt.Sprintf("%x", peer.NodeID), "dest", dest, "err", err)
+		} else {
+			d.logger.Debug("Sent Trickle update for peer", "peerNodeID", fmt.Sprintf("%x", peer.NodeID), "dest", dest)
+		}
+	}
+}
+
+// createConsistencyFunc creates the ConsistencyFunc for Trickle instances.
+// It checks if the received message (assumed to be NetworkState TLV) matches the local hash.
+func (d *DNCP) createConsistencyFunc() trickle.ConsistencyFunc[[]byte] {
+	return func(data []byte) bool {
+		// data is the raw bytes received that *should* contain TLVs
+		if data == nil {
+			d.logger.Warn("Trickle consistency check received nil data")
+			return false // Inconsistent if nil
+		}
+
+		// Use DecodeAll as the order isn't guaranteed.
+		var receivedHash []byte
+		reader := bytes.NewReader(data)
+		decodedTLVs, err := DecodeAll(reader)
+		if err != nil {
+			// Log the error but still check if NetworkState was decoded before the error
+			d.logger.Warn("Error decoding TLV stream in consistency check", "err", err)
+		}
+
+		// Find the NetworkState TLV among the decoded ones
+		found := false
+		for _, tlv := range decodedTLVs {
+			if tlv.Type == TLVTypeNetworkState {
+				netState, err := DecodeNetworkStateTLV(tlv, d.profile.HashLength)
+				if err == nil {
+					receivedHash = netState.NetworkStateHash
+					found = true
+					break // Found the first NetworkState TLV
+				}
+				d.logger.Warn("Failed to decode NetworkState TLV in consistency check", "err", err)
+				// Continue searching in case there's another valid one? No, spec implies one.
+				break
+			}
+		}
+
+		if !found {
+			d.logger.Debug("Trickle consistency check did not find a valid NetworkState TLV in received data")
+			return false // Inconsistent if we can't find/decode the hash
+		}
+
+		d.mu.RLock()
+		localHash := d.networkStateHash
+		d.mu.RUnlock()
+
+		consistent := bytes.Equal(receivedHash, localHash)
+		d.logger.Debug("Trickle consistency check", "received", hex.EncodeToString(receivedHash), "local", hex.EncodeToString(localHash), "consistent", consistent)
+		return consistent
+	}
+}
+
+// --- Dense Multicast Optimization (RFC 7787 Section 6.2) ---
+
+// checkAndHandleDenseLink evaluates the state of an endpoint and switches modes if necessary.
+// Returns true if the mode was changed (indicating a republish might be needed), false otherwise.
+// Assumes lock is held.
+func (d *DNCP) checkAndHandleDenseLink(ep *Endpoint) bool {
+	if !d.profile.UseDenseOptimization || ep.TransportMode == TransportModeUnicast {
+		return false // Optimization not enabled or not applicable
+	}
+
+	highestPeer := d.findHighestPeerOnLink(ep) // Find current highest among connected peers
+	isDense := d.profile.DensePeerThreshold > 0 && uint(len(ep.peers)) > d.profile.DensePeerThreshold
+	isHighest := highestPeer == nil || bytes.Equal(d.nodeID, highestPeer.NodeID)
+
+	modeChanged := false
+
+	if isDense && !isHighest {
+		// Condition to switch TO listen mode: Dense link, and we are NOT highest.
+		if ep.TransportMode != TransportModeMulticastListenUnicast {
+			d.logger.Info("Switching endpoint to MulticastListen+Unicast mode (dense link, not highest)", "localEpID", ep.ID, "highestNodeID", fmt.Sprintf("%x", highestPeer.NodeID))
+			d.switchToListenMode(ep, highestPeer)
+			modeChanged = true
+		} else if !bytes.Equal(ep.highestNodeOnLink, highestPeer.NodeID) {
+			// Already in listen mode, but highest node changed. Update connection.
+			d.logger.Info("Updating highest node peer in MulticastListen+Unicast mode", "localEpID", ep.ID, "newHighestNodeID", fmt.Sprintf("%x", highestPeer.NodeID))
+			// Stop old trickle, remove old peer (if different), add new peer, start new trickle.
+			// This is complex, let's simplify: just update highestNodeOnLink and rely on normal peer add/remove?
+			// For now, just update the stored highest ID. The filtering in getLocalDataForPublishing will use it.
+			// A more robust implementation might explicitly manage the single peer connection here.
+			ep.highestNodeOnLink = slices.Clone(highestPeer.NodeID)
+			// We might need to trigger AddPeerFunc for the new highest node if we don't have a connection.
+		}
+	} else {
+		// Condition to switch or stay in multicast mode: Link is not dense OR we are the highest node.
+		if ep.TransportMode != TransportModeMulticastUnicast {
+			d.logger.Info("Switching endpoint to Multicast+Unicast mode (not dense or is highest)", "localEpID", ep.ID)
+			d.switchToMulticastMode(ep)
+			modeChanged = true
+		}
+	}
+
+	return modeChanged
+}
+
+// findHighestPeerOnLink finds the peer with the highest Node ID currently in the endpoint's peer list.
+// Returns nil if no peers exist.
+// Assumes lock is held.
+func (d *DNCP) findHighestPeerOnLink(ep *Endpoint) *Peer {
+	var highestPeer *Peer
+	for _, peer := range ep.peers {
+		if highestPeer == nil || bytes.Compare(peer.NodeID, highestPeer.NodeID) > 0 {
+			highestPeer = peer
+		}
+	}
+	return highestPeer
+}
+
+// switchToListenMode transitions the endpoint to MulticastListen+Unicast mode.
+// Assumes lock is held.
+func (d *DNCP) switchToListenMode(ep *Endpoint, highestPeer *Peer) {
+	ep.TransportMode = TransportModeMulticastListenUnicast
+	ep.highestNodeOnLink = slices.Clone(highestPeer.NodeID) // Store copy
+
+	// Stop endpoint Trickle
+	if ep.trickleInstance != nil {
+		ep.trickleInstance.Stop()
+		ep.trickleInstance = nil
+		d.logger.Debug("Stopped endpoint Trickle for Listen mode", "localEpID", ep.ID)
+	}
+
+	// Remove all peers except the highest one and stop their Trickle instances
+	peersToRemove := make([]NodeIdentifier, 0)
+	for _, peer := range ep.peers {
+		if !bytes.Equal(peer.NodeID, highestPeer.NodeID) {
+			if peer.trickleInstance != nil {
+				peer.trickleInstance.Stop()
+				d.logger.Debug("Stopped peer Trickle instance for Listen mode", "localEpID", ep.ID, "peerNodeID", fmt.Sprintf("%x", peer.NodeID))
+			}
+			peersToRemove = append(peersToRemove, peer.NodeID) // Collect IDs to remove
+		}
+	}
+
+	// Remove non-highest peers from the map
+	for _, nodeIDToRemove := range peersToRemove {
+		delete(ep.peers, string(nodeIDToRemove))
+		d.logger.Debug("Removed non-highest peer for Listen mode", "localEpID", ep.ID, "peerNodeID", fmt.Sprintf("%x", nodeIDToRemove))
+		// Also remove the corresponding Peer TLV from local data (will be handled by republish)
+	}
+
+	// Ensure per-peer Trickle is running for the highest peer if needed
+	if highestPeer != nil && highestPeer.trickleInstance == nil && requiresPeerTrickle(ep.TransportMode) { // Check new mode
+		transmitFunc := d.createPeerTransmitFunc(highestPeer)
+		consistencyFunc := d.createConsistencyFunc()
+		trickleInst, err := d.profile.NewTrickleInstanceFunc(transmitFunc, consistencyFunc)
+		if err != nil {
+			d.logger.Error("Failed to create Trickle instance for highest peer", "localEpID", ep.ID, "peerNodeID", fmt.Sprintf("%x", highestPeer.NodeID), "err", err)
+		} else {
+			highestPeer.trickleInstance = trickleInst
+			highestPeer.trickleInstance.Start()
+			d.logger.Info("Started Trickle instance for highest peer in Listen mode", "localEpID", ep.ID, "peerNodeID", fmt.Sprintf("%x", highestPeer.NodeID))
+		}
+	}
+}
+
+// switchToMulticastMode transitions the endpoint back to Multicast+Unicast mode.
+// Assumes lock is held.
+func (d *DNCP) switchToMulticastMode(ep *Endpoint) {
+	ep.TransportMode = TransportModeMulticastUnicast
+	ep.highestNodeOnLink = nil // Clear highest node tracking
+
+	// Stop per-peer Trickle instances (should only be one for the previous highest)
+	for _, peer := range ep.peers {
+		if peer.trickleInstance != nil {
+			peer.trickleInstance.Stop()
+			peer.trickleInstance = nil
+			d.logger.Debug("Stopped peer Trickle for Multicast mode", "localEpID", ep.ID, "peerNodeID", fmt.Sprintf("%x", peer.NodeID))
+		}
+	}
+
+	// Start endpoint Trickle if needed
+	if ep.trickleInstance == nil && requiresEndpointTrickle(ep.TransportMode) { // Check new mode
+		transmitFunc := d.createEndpointTransmitFunc(ep)
+		consistencyFunc := d.createConsistencyFunc()
+		trickleInst, err := d.profile.NewTrickleInstanceFunc(transmitFunc, consistencyFunc)
+		if err != nil {
+			d.logger.Error("Failed to create Trickle instance for endpoint", "id", ep.ID, "err", err)
+		} else {
+			ep.trickleInstance = trickleInst
+			ep.trickleInstance.Start()
+			d.logger.Info("Started endpoint Trickle instance for Multicast mode", "id", ep.ID)
+		}
+	}
+
+	// Peers will be re-added automatically as NodeEndpoint TLVs are received via multicast.
+	// We might need to trigger AddPeerFunc for nodes we already know about?
+	// For now, rely on receiving messages again.
+}
+
 // --- Trickle Integration ---
 
 // resetAllTrickle signals inconsistency to all active Trickle instances.
@@ -802,8 +908,9 @@ func (d *DNCP) resetAllTrickle() {
 // --- TLV Processing (RFC 7787 Section 4.4) ---
 
 // HandleReceivedTLVs processes a buffer of received TLV data from a specific source.
-func (d *DNCP) HandleReceivedTLVs(data []byte, sourceAddr string, receivedOnLocalEpID EndpointIdentifier) error {
-	d.logger.Debug("Handling received data", "source", sourceAddr, "localEpID", receivedOnLocalEpID, "len", len(data))
+// isMulticast indicates if the data arrived via a multicast transport.
+func (d *DNCP) HandleReceivedTLVs(data []byte, sourceAddr string, receivedOnLocalEpID EndpointIdentifier, isMulticast bool) error {
+	d.logger.Debug("Handling received data", "source", sourceAddr, "localEpID", receivedOnLocalEpID, "len", len(data), "isMulticast", isMulticast)
 	reader := bytes.NewReader(data)
 
 	// Need sender's NodeID and EndpointID for processing Peer TLVs etc.
@@ -814,6 +921,8 @@ func (d *DNCP) HandleReceivedTLVs(data []byte, sourceAddr string, receivedOnLoca
 	// Assuming datagram transport where it MUST be first if present.
 	var tlvsToProcess []*TLV
 	firstTLV, err := Decode(reader)
+
+	needsDenseCheck := false
 
 	switch {
 	case errors.Is(err, io.EOF):
@@ -831,23 +940,54 @@ func (d *DNCP) HandleReceivedTLVs(data []byte, sourceAddr string, receivedOnLoca
 		// Fall through to DecodeAll below
 	case firstTLV != nil && firstTLV.Type == TLVTypeNodeEndpoint:
 		// Successfully decoded NodeEndpoint TLV first.
-		nodeEpTLV, decodeErr := DecodeNodeEndpointTLV(firstTLV, d.profile.NodeIdentifierLength)
-		if decodeErr != nil {
-			d.logger.Warn("Failed to decode NodeEndpoint TLV", "source", sourceAddr, "err", decodeErr)
-			// Proceed without sender info? Or discard? For now, proceed.
+		nodeEpTLV, err := DecodeNodeEndpointTLV(firstTLV, d.profile.NodeIdentifierLength)
+		if err != nil {
+			d.logger.Warn("Failed to decode NodeEndpoint TLV", "source", sourceAddr, "err", err)
+			return fmt.Errorf("broken NodeEndpointTLV: %w", err)
+		}
+		senderNodeID = nodeEpTLV.NodeID
+		senderEndpointID = nodeEpTLV.EndpointID
+		d.logger.Debug("Decoded NodeEndpoint TLV", "source", sourceAddr, "senderNodeID", fmt.Sprintf("%x", senderNodeID), "senderEpID", senderEndpointID)
+
+		// --- Dense Mode: Track Highest Node ID ---
+		// Regardless of mode, track the highest node ID seen on the link via multicast.
+		// This is needed to decide if *this* node should be the active one in dense mode.
+		if isMulticast && d.profile.UseDenseOptimization {
+			d.mu.Lock()
+			if ep, ok := d.endpoints[receivedOnLocalEpID]; ok {
+				// Update highestNodeOnLink if the sender is higher than the current highest (or if none is set)
+				if ep.highestNodeOnLink == nil || bytes.Compare(senderNodeID, ep.highestNodeOnLink) > 0 {
+					d.logger.Debug("New highest node ID detected on link", "localEpID", receivedOnLocalEpID, "newNodeID", fmt.Sprintf("%x", senderNodeID), "oldNodeID", fmt.Sprintf("%x", ep.highestNodeOnLink))
+					ep.highestNodeOnLink = slices.Clone(senderNodeID) // Store a copy
+					// If we are in listen mode, and the highest node changed, we need to re-evaluate
+					if ep.TransportMode == TransportModeMulticastListenUnicast {
+						needsDenseCheck = true
+					}
+				}
+			}
+			d.mu.Unlock()
+		}
+
+		// --- Process Peer Addition/Update (Sec 4.5) ---
+		if isMulticast {
+			if d.AddPeerFunc != nil {
+				d.logger.Debug("Triggering AddPeerFunc for multicast discovery", "source", sourceAddr, "senderNodeID", fmt.Sprintf("%x", senderNodeID))
+				// Call AddPeerFunc asynchronously? Or let the implementation decide? Let implementation decide for now.
+				err := d.AddPeerFunc(receivedOnLocalEpID, senderNodeID, senderEndpointID, sourceAddr)
+				if err != nil {
+					d.logger.Error("AddPeerFunc callback failed", "source", sourceAddr, "err", err)
+				}
+			} else {
+				d.logger.Debug("Received NodeEndpoint via multicast, but no AddPeerFunc configured", "source", sourceAddr)
+			}
 		} else {
-			senderNodeID = nodeEpTLV.NodeID
-			senderEndpointID = nodeEpTLV.EndpointID
-			d.logger.Debug("Decoded NodeEndpoint TLV", "source", sourceAddr, "senderNodeID", fmt.Sprintf("%x", senderNodeID), "senderEpID", senderEndpointID)
-			// Process peer addition/update based on NodeEndpoint TLV (Sec 4.5)
-			addPeerErr := d.AddOrUpdatePeer(receivedOnLocalEpID, senderNodeID, senderEndpointID, sourceAddr) // Use sourceAddr directly for now
+			// Received via unicast, proceed with adding/updating the peer state and Peer TLV
+			addPeerErr := d.AddOrUpdatePeer(receivedOnLocalEpID, senderNodeID, senderEndpointID, sourceAddr)
 			if addPeerErr != nil {
-				d.logger.Error("Failed to add/update peer from NodeEndpoint TLV", "source", sourceAddr, "err", addPeerErr)
+				d.logger.Error("Failed to add/update peer from unicast NodeEndpoint TLV", "source", sourceAddr, "err", addPeerErr)
 				// Continue processing other TLVs? Yes.
 			}
 		}
-		// NodeEndpoint TLV is processed, don't add it to tlvsToProcess.
-		// Continue to DecodeAll for remaining TLVs.
 	case firstTLV != nil:
 		// First TLV was valid but not NodeEndpoint. Reset reader and let DecodeAll handle it.
 		_, _ = reader.Seek(0, io.SeekStart)
@@ -872,6 +1012,24 @@ func (d *DNCP) HandleReceivedTLVs(data []byte, sourceAddr string, receivedOnLoca
 		d.processSingleTLV(tlv, senderNodeID, senderEndpointID, sourceAddr, receivedOnLocalEpID)
 	}
 
+	// Perform dense check if triggered by highest node ID change
+	if needsDenseCheck {
+		d.mu.Lock()
+		if ep, ok := d.endpoints[receivedOnLocalEpID]; ok {
+			if d.checkAndHandleDenseLink(ep) {
+				// Mode changed, need to republish
+				d.mu.Unlock() // Unlock before PublishData
+				currentData := d.getLocalDataForPublishing()
+				err := d.PublishData(currentData)
+				d.mu.Lock() // Re-lock
+				if err != nil {
+					d.logger.Error("Failed to republish data after dense mode change", "localEpID", receivedOnLocalEpID, "err", err)
+				}
+			}
+		}
+		d.mu.Unlock()
+	}
+
 	return nil // Return nil even if DecodeAll had errors, as some TLVs might have been processed
 }
 
@@ -880,7 +1038,7 @@ func (d *DNCP) HandleReceivedTLVs(data []byte, sourceAddr string, receivedOnLoca
 func (d *DNCP) processSingleTLV(tlv *TLV, senderNodeID NodeIdentifier, senderEndpointID EndpointIdentifier, sourceAddr string, _ EndpointIdentifier) {
 	d.logger.Debug("Processing TLV", "type", tlv.Type, "len", tlv.Length, "senderNodeID", fmt.Sprintf("%x", senderNodeID), "senderEpID", senderEndpointID, "source", sourceAddr)
 
-	// TODO: Implement rate limiting for replies (e.g., Request Network State)
+	// MAY: Implement rate limiting for replies (e.g., Request Network State)
 
 	switch tlv.Type {
 	case TLVTypeRequestNetworkState:
@@ -904,7 +1062,8 @@ func (d *DNCP) processSingleTLV(tlv *TLV, senderNodeID NodeIdentifier, senderEnd
 			return
 		}
 		d.logger.Debug("Received NetworkState", "source", sourceAddr, "hash", hex.EncodeToString(netStateTLV.NetworkStateHash))
-		d.handleNetworkStateTLV(netStateTLV, sourceAddr)
+		// Pass senderNodeID for peer lookup
+		d.handleNetworkStateTLV(netStateTLV, senderNodeID, sourceAddr)
 
 	case TLVTypeNodeState:
 		nodeStateTLV, err := DecodeNodeStateTLV(tlv, d.profile.NodeIdentifierLength, d.profile.HashLength)
@@ -931,21 +1090,41 @@ func (d *DNCP) processSingleTLV(tlv *TLV, senderNodeID NodeIdentifier, senderEnd
 }
 
 // handleNetworkStateTLV processes a received Network State TLV.
-func (d *DNCP) handleNetworkStateTLV(netStateTLV *NetworkStateTLV, sourceAddr string) {
+// senderNodeID is needed to update the correct peer's LastContact timestamp.
+func (d *DNCP) handleNetworkStateTLV(netStateTLV *NetworkStateTLV, senderNodeID NodeIdentifier, sourceAddr string) {
 	d.mu.RLock()
 	localHash := d.networkStateHash
 	d.mu.RUnlock()
 
 	if !bytes.Equal(netStateTLV.NetworkStateHash, localHash) {
 		d.logger.Info("Received different network state hash", "source", sourceAddr, "received", hex.EncodeToString(netStateTLV.NetworkStateHash), "local", hex.EncodeToString(localHash))
-		// TODO: Implement rate limiting for requests
+		// MAY: Implement rate limiting for requests
 		// Reply with Request Network State TLV (Section 4.4)
 		d.requestNetworkState(sourceAddr)
 		// MAY also send local Network State TLV
 		// d.sendNetworkState(sourceAddr)
 	} else {
 		d.logger.Debug("Received matching network state hash", "source", sourceAddr)
-		// TODO: Update peer LastContact timestamp if keep-alives enabled (Sec 6.1.4)
+		// Update peer LastContact timestamp if keep-alives enabled (Sec 6.1.4)
+		if d.profile.KeepAliveInterval > 0 && senderNodeID != nil {
+			d.mu.Lock()
+			found := false
+			peerKey := string(senderNodeID)
+			now := d.clock.Now()
+			for _, ep := range d.endpoints {
+				if peer, ok := ep.peers[peerKey]; ok {
+					// Check if source address matches? Maybe not necessary if NodeID is unique.
+					peer.LastContact = now
+					d.logger.Debug("Updated peer LastContact from consistent NetworkState", "peerNodeID", fmt.Sprintf("%x", senderNodeID), "localEpID", ep.ID, "time", now)
+					found = true
+					break // Found the peer, no need to check other endpoints
+				}
+			}
+			if !found {
+				d.logger.Warn("Received consistent NetworkState, but could not find peer to update timestamp", "senderNodeID", fmt.Sprintf("%x", senderNodeID), "source", sourceAddr)
+			}
+			d.mu.Unlock()
+		}
 	}
 }
 
