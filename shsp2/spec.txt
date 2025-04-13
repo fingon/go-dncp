@@ -1,0 +1,24 @@
+SHSP2
+
+This is the DNCP profile of SHSP2, an experimental home automation
+protocol.
+
+   o Multicast transport: IPv6 UDP on port 53923 to link-local scoped multicast address ff02::1:0:42. Each multicast should contain new TLV 768, which contains HTTP port to send requests to.
+
+   o Unicast transport: IPv6 link local only HTTP request to source port identified in UDP multicast payloads.
+
+   o Security: None. (upper layers care about security)
+
+   o Additional TLVs to be ignored: None.  No DNCP security is specified, and no new TLVs are defined outside of node data.
+
+   o  Node identifier length (DNCP_NODE_IDENTIFIER_LENGTH): 32 bits that are randomly generated.
+
+   o  Node identifier collision handling: Pick new random node identifier.
+
+   o  Trickle parameters: Imin = 200 ms, Imax = 7, k = 1.  It means at least one multicast per link in 25 seconds in stable state (0.2 * 2^7).
+
+   o Hash function H(x) + length: SHA-256.
+
+   o As HTTP does not have persistent connections, keep-alives should be used, but with the dense optimization; if there are more than 2 nodes on the link, dense mode should be used (Section 6.1).
+
+   o  No support for dense multicast-enabled link optimization (Section 6.2)
