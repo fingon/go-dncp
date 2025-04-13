@@ -32,13 +32,17 @@ const (
 // TLV represents a single Type-Length-Value object as defined in RFC 7787 Section 7.
 type TLV struct {
 	Type   TLVType
-	Length uint16 // Length of the Value field only
-	Value  []byte
-	// SubTLVs are not explicitly modeled here yet but could be parsed from Value.
+	Length uint16 // Length of the Value field only (excluding padding)
+	Value  []byte // The raw value bytes
+	// SubTLVs are not explicitly modeled here; they are part of the Value.
 }
 
 // TlvHeaderSize is the fixed size of the TLV header (Type + Length).
 const TlvHeaderSize = 4 // 2 bytes for Type, 2 bytes for Length
+
+// MaxTLVValueLength is derived from the maximum node data size (64KB).
+// A single TLV's value cannot exceed this.
+const MaxTLVValueLength = 65535 - TlvHeaderSize
 
 // ErrInvalidTLVLength indicates a TLV record has an invalid length.
 var ErrInvalidTLVLength = errors.New("invalid TLV length")
@@ -84,68 +88,59 @@ func (t *TLV) Encode(w io.Writer) error {
 // Decode decodes a single TLV from the provided reader.
 // It reads the header, value, and consumes any required padding bytes.
 // Returns io.EOF if the reader is empty or contains insufficient data for a header.
-// Returns io.ErrUnexpectedEOF if the value or padding cannot be fully read according
-// to the length specified in the header.
+// Returns io.ErrUnexpectedEOF if the value or padding cannot be fully read
+// according to the length specified in the header.
 func Decode(r io.Reader) (*TLV, error) {
 	header := make([]byte, TlvHeaderSize)
-	n, err := io.ReadFull(r, header)
+	nRead, err := io.ReadFull(r, header)
 	if err != nil {
-		// If we read 0 bytes and hit EOF, it's a clean EOF.
-		// If we read > 0 bytes but < header size and hit EOF, it's UnexpectedEOF.
-		// If any other error occurs, return it wrapped.
-		if errors.Is(err, io.EOF) && n == 0 {
-			return nil, io.EOF // Clean EOF at the very beginning
+		// Handle EOF cases specifically
+		if errors.Is(err, io.EOF) {
+			// Clean EOF only if 0 bytes were read. Otherwise, it's unexpected.
+			if nRead == 0 {
+				return nil, io.EOF
+			}
+			err = io.ErrUnexpectedEOF // Treat partial read + EOF as UnexpectedEOF
 		}
-		if errors.Is(err, io.ErrUnexpectedEOF) || (errors.Is(err, io.EOF) && n > 0) {
-			// Not enough bytes for a full header
-			return nil, fmt.Errorf("failed to read full TLV header (read %d bytes): %w", n, io.ErrUnexpectedEOF)
-		}
-		// Other read errors
-		return nil, fmt.Errorf("failed to read TLV header: %w", err)
+		// Wrap other errors or UnexpectedEOF
+		return nil, fmt.Errorf("failed to read TLV header (read %d bytes): %w", nRead, err)
 	}
 
 	tlvType := TLVType(binary.BigEndian.Uint16(header[0:2]))
 	length := binary.BigEndian.Uint16(header[2:4])
 
-	// Basic sanity check for length. RFC 7787 Section 8 limits Node Data Items
-	// (which contain TLVs) to 65535 bytes total. A single TLV's value length
-	// must be less than that.
-	const maxTLVPossibleLength = 65535 - TlvHeaderSize
-	if length > maxTLVPossibleLength {
-		// This TLV claims a length that's impossible within the protocol limits.
+	// Validate length against maximum possible value length
+	if length > MaxTLVValueLength {
 		return nil, fmt.Errorf("%w: declared length %d exceeds maximum possible %d",
-			ErrInvalidTLVLength, length, maxTLVPossibleLength)
+			ErrInvalidTLVLength, length, MaxTLVValueLength)
 	}
 
+	// Read value bytes
 	value := make([]byte, length)
 	if length > 0 {
-		n, err = io.ReadFull(r, value)
+		nRead, err = io.ReadFull(r, value)
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				// Indicate unexpected EOF if value couldn't be fully read
-				return nil, fmt.Errorf("failed to read TLV value (expected %d bytes, read %d): %w",
-					length, n, io.ErrUnexpectedEOF)
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF // EOF during value read is always unexpected
 			}
-			return nil, fmt.Errorf("failed to read TLV value: %w", err)
+			return nil, fmt.Errorf("failed to read TLV value (expected %d bytes, read %d): %w",
+				length, nRead, err)
 		}
 	}
 
-	// Calculate and consume padding
+	// Calculate and consume padding bytes
 	paddingLen := (4 - (int(length) % 4)) % 4
 	if paddingLen > 0 {
 		padding := make([]byte, paddingLen)
-		n, err = io.ReadFull(r, padding)
+		nRead, err = io.ReadFull(r, padding)
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				// Indicate unexpected EOF if padding couldn't be fully read
-				return nil, fmt.Errorf("failed to read TLV padding (expected %d bytes, read %d): %w",
-					paddingLen, n, io.ErrUnexpectedEOF)
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF // EOF during padding read is always unexpected
 			}
-			// Return the specific padding read error
-			return nil, fmt.Errorf("failed to read TLV padding: %w", err)
+			return nil, fmt.Errorf("failed to read TLV padding (expected %d bytes, read %d): %w",
+				paddingLen, nRead, err)
 		}
-		// RFC 7787 Section 7: "padding bytes with a value of zero"
-		// Currently, we don't enforce this strictly, just consume them.
+		// Optional: Verify padding is all zeros
 		// for _, b := range padding {
 		// 	if b != 0 {
 		// 		// Log warning? Return error? Profile specific? For now, just note.
@@ -154,11 +149,11 @@ func Decode(r io.Reader) (*TLV, error) {
 		// }
 	}
 
-	// If we've reached here, all parts (header, value, padding) were read successfully.
+	// Successfully read header, value, and padding
 	return &TLV{
-		Type:   tlvType, // Use the tlvType read at the beginning
-		Length: length,  // Use the length read at the beginning
-		Value:  value,   // Use the value read earlier
+		Type:   tlvType,
+		Length: length,
+		Value:  value,
 	}, nil
 }
 
@@ -176,7 +171,6 @@ func DecodeAll(r io.Reader) ([]*TLV, error) {
 		}
 		tlvs = append(tlvs, tlv)
 	}
-	// Check if any TLVs were decoded if EOF was the first result?
-	// No, Decode handles EOF correctly if the stream is empty.
+	// Decode handles EOF correctly if the stream is initially empty.
 	return tlvs, nil
 }

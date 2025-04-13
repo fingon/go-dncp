@@ -6,7 +6,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/fingon/go-dncp" // Use alias if package name is dncp
+	"github.com/fingon/go-dncp"
 	"gotest.tools/v3/assert"
 )
 
@@ -135,7 +135,7 @@ func TestDecodeErrors(t *testing.T) {
 
 	t.Run("Incomplete header", func(t *testing.T) {
 		_, err := dncp.Decode(bytes.NewReader([]byte{0x00, 0x01, 0x00})) // 3 bytes only
-		assert.ErrorContains(t, err, "failed to read full TLV header")
+		assert.ErrorContains(t, err, "failed to read TLV header")        // Updated expected error message
 		assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
 	})
 
