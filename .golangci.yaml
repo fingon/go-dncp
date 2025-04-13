@@ -14,7 +14,7 @@ linters:
     - nestif
     - nilerr
     - perfsprint
-    - prealloc
+    # - prealloc # performance, but not useful
     - reassign
     - revive
     - sloglint
