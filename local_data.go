@@ -46,8 +46,23 @@ func (d *DNCP) getLocalDataForPublishing() NodeData {
 		localData[TLVTypePeer] = peerTLVs
 	}
 
-	// Add KeepAlive TLVs if needed (profile default is probably good enough for now)
-	// TODO: Implement KeepAlive TLV creation based on endpoint config
+	// Add KeepAlive TLVs if specific endpoint intervals differ from profile default
+	keepAliveTLVs := make([]*TLV, 0)
+	profileDefaultKA := d.profile.KeepAliveInterval
+	for epID, ep := range d.endpoints {
+		// ep.KeepAliveInterval should be defaulted to profile value in AddEndpoint if initially 0
+		if ep.KeepAliveInterval > 0 && ep.KeepAliveInterval != profileDefaultKA {
+			kaTLV, err := NewKeepAliveIntervalTLV(epID, ep.KeepAliveInterval)
+			if err != nil {
+				d.logger.Error("Failed to create KeepAliveInterval TLV for publishing", "localEpID", epID, "interval", ep.KeepAliveInterval, "err", err)
+				continue // Skip this one
+			}
+			keepAliveTLVs = append(keepAliveTLVs, kaTLV)
+		}
+	}
+	if len(keepAliveTLVs) > 0 {
+		localData[TLVTypeKeepAliveInterval] = keepAliveTLVs
+	}
 
 	return localData
 }

@@ -82,5 +82,11 @@ func NewSHSP2Profile(logger *slog.Logger, clock timeish.Clock) dncp.Profile {
 		Clock:                clock,
 		// RandSource: Use default
 		NewTrickleInstanceFunc: newTrickleFunc,
+		// HandleCollisionFunc: Application should provide an implementation.
+		// Per SHSP2 spec, the handler should generate a new random Node ID
+		// (SHSP2NodeIdentifierLength bytes) and likely trigger a restart
+		// of the DNCP instance with the new ID. Returning an error from
+		// the handler can signal the need for a restart.
+		HandleCollisionFunc: nil,
 	}
 }

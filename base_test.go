@@ -116,7 +116,6 @@ func setupTest(t *testing.T, nodeID dncp.NodeIdentifier, profileMod func(p *dncp
 		DensePeerThreshold:   0,
 		Logger:               logger,
 		Clock:                mockClock,
-		// RandSource: // Use default
 		NewTrickleInstanceFunc: func(transmitFunc trickle.TransmitFunc, consistencyFunc trickle.ConsistencyFunc[[]byte]) (*trickle.Trickle[[]byte], error) {
 			cfg := trickle.Config[[]byte]{
 				Imin:            100 * time.Millisecond, // Use profile values? Yes.

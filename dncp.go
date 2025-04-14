@@ -9,11 +9,12 @@ import (
 	"hash"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"slices"
 	"sync"
 	"time"
 
-	"github.com/fingon/go-dncp/timeish" // Import timeish
+	"github.com/fingon/go-dncp/timeish"
 	"github.com/fingon/go-dncp/trickle"
 )
 
@@ -92,13 +93,15 @@ type Profile struct {
 	// Clock provides the time source. If nil, uses real time.
 	Clock timeish.Clock // Use timeish.Clock
 	// RandSource provides the random number source. If nil, a default is used.
-	RandSource *uint64 // Pointer to allow sharing if needed, or nil for default
+	RandSource rand.Source // Use rand.Source interface from math/rand/v2
 
 	// NewTrickleInstanceFunc creates a Trickle instance for an endpoint or peer.
 	// The implementation should configure the TransmitFunc and ConsistencyFunc
 	// based on the provided context (e.g., destination address).
 	// The returned Trickle instance should *not* be started yet.
 	NewTrickleInstanceFunc func(transmitFunc trickle.TransmitFunc, consistencyFunc trickle.ConsistencyFunc[[]byte]) (*trickle.Trickle[[]byte], error)
+	// HandleCollisionFunc is an optional callback invoked when a collision for the local node ID is detected.
+	HandleCollisionFunc func() error
 }
 
 // NodeData represents the set of TLVs published by a node.
@@ -145,6 +148,7 @@ type Endpoint struct {
 	trickleInstance   *trickle.Trickle[[]byte] // Trickle state for multicast/endpoint
 	peers             map[string]*Peer         // Peers discovered/configured on this endpoint, keyed by string(NodeID)
 	highestNodeOnLink NodeIdentifier           // Node ID of the highest peer seen on this link (for dense mode)
+	KeepAliveInterval time.Duration            // Specific keep-alive for this endpoint (0=use profile default)
 }
 
 // DNCP represents a single DNCP node instance.
@@ -175,6 +179,14 @@ type DNCP struct {
 	AddPeerFunc func(localEndpointID EndpointIdentifier, peerNodeID NodeIdentifier, peerEndpointID EndpointIdentifier, peerAddress string) error
 	// RemovePeerFunc is called when a peer relationship should be terminated.
 	RemovePeerFunc func(localEndpointID EndpointIdentifier, peerNodeID NodeIdentifier) error
+	// HandleCollisionFunc is called when a node state update for the local node ID
+	// is received with a higher sequence number or same sequence number but different hash.
+	// The implementation should typically generate a new node ID and restart DNCP.
+	// If nil, the default behavior is to republish local state with a higher sequence number.
+	HandleCollisionFunc func() error
+
+	// --- Internal State for Rate Limiting ---
+	lastNetStateRequest map[string]map[string]time.Time // sourceAddr -> hex(hash) -> time
 }
 
 // GetNodeID returns the node identifier of this DNCP instance.
@@ -223,17 +235,24 @@ func New(nodeID NodeIdentifier, profile Profile) (*DNCP, error) {
 	if profile.Clock == nil {
 		profile.Clock = timeish.NewRealClock() // Use real time from timeish
 	}
-	// RandSource default is handled by Trickle New
+	if profile.RandSource == nil {
+		// Use a default source if none provided.
+		now := profile.Clock.Now()
+		profile.RandSource = rand.NewPCG(uint64(now.UnixNano()), uint64(now.UnixNano()/2))
+		slog.Debug("DNCP Profile RandSource is nil, using default PCG source")
+	}
 
 	// --- Initialize DNCP Instance ---
 	d := &DNCP{
-		profile:   &profile, // Store a pointer to the validated profile
-		nodeID:    slices.Clone(nodeID),
-		logger:    profile.Logger.With("module", "dncp", "nodeID", fmt.Sprintf("%x", nodeID)), // Use fmt for hex
-		clock:     profile.Clock,
-		nodes:     make(map[string]*NodeState),
-		endpoints: make(map[EndpointIdentifier]*Endpoint),
-		stopChan:  make(chan struct{}),
+		profile:             &profile, // Store a pointer to the validated profile
+		nodeID:              slices.Clone(nodeID),
+		logger:              profile.Logger.With("module", "dncp", "nodeID", fmt.Sprintf("%x", nodeID)), // Use fmt for hex
+		clock:               profile.Clock,
+		nodes:               make(map[string]*NodeState),
+		endpoints:           make(map[EndpointIdentifier]*Endpoint),
+		stopChan:            make(chan struct{}),
+		HandleCollisionFunc: profile.HandleCollisionFunc, // Assign from profile
+		lastNetStateRequest: make(map[string]map[string]time.Time),
 	}
 
 	// Initialize local node state
@@ -466,7 +485,7 @@ func (d *DNCP) HandleReceivedTLVs(data []byte, sourceAddr string, receivedOnLoca
 
 	// Process decoded TLVs
 	for _, tlv := range tlvsToProcess {
-		d.processSingleTLV(tlv, senderNodeID, senderEndpointID, sourceAddr, receivedOnLocalEpID)
+		d.processSingleTLV(tlv, senderNodeID, senderEndpointID, sourceAddr, isMulticast)
 	}
 
 	// Perform dense check if triggered by highest node ID change

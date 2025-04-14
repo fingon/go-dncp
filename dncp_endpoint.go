@@ -19,6 +19,10 @@ func (d *DNCP) AddEndpoint(ep Endpoint) error {
 	if ep.peers == nil {
 		ep.peers = make(map[string]*Peer)
 	}
+	// Default KeepAliveInterval if not specified for the endpoint
+	if ep.KeepAliveInterval <= 0 {
+		ep.KeepAliveInterval = d.profile.KeepAliveInterval
+	}
 
 	// Initialize Trickle instance based on TransportMode
 	if d.profile.NewTrickleInstanceFunc != nil && requiresEndpointTrickle(ep.TransportMode) {

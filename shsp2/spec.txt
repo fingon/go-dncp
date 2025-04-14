@@ -22,5 +22,3 @@ protocol.
    o Hash function H(x) + length: SHA-256.
 
    o As HTTP does not have persistent connections, keep-alives should be used, but with the dense optimization; if there are more than 2 nodes on the link, dense mode should be used (Section 6.1).
-
-   o  No support for dense multicast-enabled link optimization (Section 6.2)
