@@ -240,10 +240,10 @@ func TestPublishData(t *testing.T) {
 	// TODO: Need a way to get current local NodeState easily
 
 	// Publish some data
-	testTLV, err := dncp.NewKeepAliveIntervalTLV(0, 1234*time.Millisecond) // Example TLV
+	testMarshaler, err := dncp.NewKeepAliveIntervalTLV(0, 1234*time.Millisecond) // Example TLV Marshaler
 	assert.NilError(t, err)
 	newData := dncp.NodeData{
-		dncp.TLVTypeKeepAliveInterval: []*dncp.TLV{testTLV},
+		dncp.TLVTypeKeepAliveInterval: []dncp.TLVMarshaler{testMarshaler},
 	}
 
 	err = h.dncp.PublishData(newData)

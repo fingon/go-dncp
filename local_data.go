@@ -6,21 +6,24 @@ import (
 	"slices"
 )
 
-// getLocalDataForPublishing constructs the NodeData map for the local node,
-// including current Peer TLVs and KeepAlive TLVs.
+// getLocalDataForPublishing constructs the NodeData map (map[TLVType][]TLVMarshaler)
+// for the local node, including current Peer TLVs and KeepAlive TLVs.
 // Assumes lock is held.
 func (d *DNCP) getLocalDataForPublishing() NodeData {
-	// Start with a deep copy of existing data
-	localData := make(NodeData, len(d.localState.Data))
-	for typ, tlvSlice := range d.localState.Data {
-		localData[typ] = slices.Clone(tlvSlice) // Clone the slice
+	// Start with a deep copy of existing non-generated data?
+	// Or assume localState.Data only holds non-generated TLVs?
+	// Let's assume localState.Data holds application-specific TLVs,
+	// and we add Peer/KeepAlive TLVs here.
+	localData := make(NodeData) // Start fresh
+	// Copy application-specific TLVs (if any were stored directly)
+	for typ, marshalerSlice := range d.localState.Data {
+		if typ != TLVTypePeer && typ != TLVTypeKeepAliveInterval {
+			localData[typ] = slices.Clone(marshalerSlice) // Clone the slice
+		}
 	}
-	// Clear existing Peer and KeepAlive TLVs, they will be regenerated
-	delete(localData, TLVTypePeer)
-	delete(localData, TLVTypeKeepAliveInterval)
 
 	// Add current Peer TLVs
-	peerTLVs := make([]*TLV, 0) // Collect all peer TLVs first
+	peerMarshalers := make([]TLVMarshaler, 0) // Collect all peer marshalers
 	for localEpID, ep := range d.endpoints {
 		for _, peer := range ep.peers {
 			// Apply dense optimization filtering (RFC 7787 Section 6.2)
@@ -34,98 +37,96 @@ func (d *DNCP) getLocalDataForPublishing() NodeData {
 				d.logger.Debug("Dense optimization: Publishing peer TLV for highest node", "localEpID", localEpID, "peerNodeID", fmt.Sprintf("%x", peer.NodeID))
 			}
 
-			peerTLV, err := NewPeerTLV(peer.NodeID, peer.EndpointID, localEpID, d.profile.NodeIdentifierLength)
+			// Create PeerTLV struct instance
+			peerMarshaler, err := NewPeerTLV(peer.NodeID, peer.EndpointID, localEpID)
 			if err != nil {
 				d.logger.Error("Failed to create Peer TLV for publishing", "localEpID", localEpID, "peerNodeID", fmt.Sprintf("%x", peer.NodeID), "err", err)
 				continue // Skip this peer
 			}
-			peerTLVs = append(peerTLVs, peerTLV)
+			peerMarshalers = append(peerMarshalers, peerMarshaler)
 		}
 	}
-	if len(peerTLVs) > 0 {
-		localData[TLVTypePeer] = peerTLVs
+	if len(peerMarshalers) > 0 {
+		localData[TLVTypePeer] = peerMarshalers
 	}
 
 	// Add KeepAlive TLVs if specific endpoint intervals differ from profile default
-	keepAliveTLVs := make([]*TLV, 0)
+	keepAliveMarshalers := make([]TLVMarshaler, 0)
 	profileDefaultKA := d.profile.KeepAliveInterval
 	for epID, ep := range d.endpoints {
 		// ep.KeepAliveInterval should be defaulted to profile value in AddEndpoint if initially 0
 		if ep.KeepAliveInterval > 0 && ep.KeepAliveInterval != profileDefaultKA {
-			kaTLV, err := NewKeepAliveIntervalTLV(epID, ep.KeepAliveInterval)
+			// Create KeepAliveIntervalTLV struct instance
+			kaMarshaler, err := NewKeepAliveIntervalTLV(epID, ep.KeepAliveInterval)
 			if err != nil {
 				d.logger.Error("Failed to create KeepAliveInterval TLV for publishing", "localEpID", epID, "interval", ep.KeepAliveInterval, "err", err)
 				continue // Skip this one
 			}
-			keepAliveTLVs = append(keepAliveTLVs, kaTLV)
+			keepAliveMarshalers = append(keepAliveMarshalers, kaMarshaler)
 		}
 	}
-	if len(keepAliveTLVs) > 0 {
-		localData[TLVTypeKeepAliveInterval] = keepAliveTLVs
+	if len(keepAliveMarshalers) > 0 {
+		localData[TLVTypeKeepAliveInterval] = keepAliveMarshalers
 	}
 
 	return localData
 }
 
-// addLocalPeerTLV adds a Peer TLV to the local node's state.
-// Returns true if the state was changed (TLV was added), false otherwise.
+// addLocalPeerTLV adds a Peer TLV marshaler to the local node's state.
+// Returns true if the state was changed (marshaler was added), false otherwise.
 // Assumes lock is held.
 func (d *DNCP) addLocalPeerTLV(localEpID EndpointIdentifier, peerNodeID NodeIdentifier, peerEpID EndpointIdentifier) bool {
-	// Create the TLV
-	newPeerTLV, err := NewPeerTLV(peerNodeID, peerEpID, localEpID, d.profile.NodeIdentifierLength)
+	// Create the marshaler
+	newPeerMarshaler, err := NewPeerTLV(peerNodeID, peerEpID, localEpID)
 	if err != nil {
-		d.logger.Error("Failed to create Peer TLV for local state", "err", err)
+		d.logger.Error("Failed to create Peer TLV marshaler for local state", "err", err)
 		return false
 	}
 
-	// Check if an identical TLV already exists
-	existingTLVs := d.localState.Data[TLVTypePeer]
-	for _, existingTLV := range existingTLVs {
-		// Compare contents (Type, Length, Value)
-		if existingTLV.Type == newPeerTLV.Type &&
-			existingTLV.Length == newPeerTLV.Length &&
-			bytes.Equal(existingTLV.Value, newPeerTLV.Value) {
-			d.logger.Debug("Identical Peer TLV already exists, not adding", "localEpID", localEpID, "peerNodeID", fmt.Sprintf("%x", peerNodeID))
-			return false // No change
+	// Check if an identical marshaler already exists
+	existingMarshalers := d.localState.Data[TLVTypePeer]
+	for _, existingMarshaler := range existingMarshalers {
+		// Type assert and compare fields
+		if existingPeer, ok := existingMarshaler.(*PeerTLV); ok {
+			if existingPeer.LocalEndpointID == newPeerMarshaler.LocalEndpointID &&
+				existingPeer.PeerEndpointID == newPeerMarshaler.PeerEndpointID &&
+				bytes.Equal(existingPeer.PeerNodeID, newPeerMarshaler.PeerNodeID) {
+				d.logger.Debug("Identical Peer TLV already exists, not adding", "localEpID", localEpID, "peerNodeID", fmt.Sprintf("%x", peerNodeID))
+				return false // No change
+			}
 		}
 	}
 
-	// Append the new TLV
-	d.localState.Data[TLVTypePeer] = append(existingTLVs, newPeerTLV)
+	// Append the new marshaler
+	d.localState.Data[TLVTypePeer] = append(existingMarshalers, newPeerMarshaler)
 	d.logger.Debug("Added Peer TLV to local state", "localEpID", localEpID, "peerNodeID", fmt.Sprintf("%x", peerNodeID))
 	return true // State changed
 }
 
-// removeLocalPeerTLV removes a specific Peer TLV from the local node's state.
-// Returns true if a TLV was removed, false otherwise.
+// removeLocalPeerTLV removes a specific Peer TLV marshaler from the local node's state.
+// Returns true if a marshaler was removed, false otherwise.
 // Assumes lock is held.
 func (d *DNCP) removeLocalPeerTLV(localEpID EndpointIdentifier, peerNodeID NodeIdentifier, peerEpID EndpointIdentifier) bool {
-	existingTLVs, exists := d.localState.Data[TLVTypePeer]
-	if !exists || len(existingTLVs) == 0 {
+	existingMarshalers, exists := d.localState.Data[TLVTypePeer]
+	if !exists || len(existingMarshalers) == 0 {
 		return false // Nothing to remove
 	}
 
 	foundIndex := -1
-	for i, tlv := range existingTLVs {
-		// Decode each TLV to compare details
-		// Optimization: Could compare raw bytes if NewPeerTLV is deterministic
-		decodedTLV, err := DecodePeerTLV(tlv, d.profile.NodeIdentifierLength)
-		if err != nil {
-			d.logger.Warn("Failed to decode Peer TLV during removal check", "err", err)
-			continue // Skip this one
-		}
-
-		if decodedTLV.LocalEndpointID == localEpID &&
-			bytes.Equal(decodedTLV.PeerNodeID, peerNodeID) &&
-			decodedTLV.PeerEndpointID == peerEpID {
-			foundIndex = i
-			break
+	for i, marshaler := range existingMarshalers {
+		if peerTLV, ok := marshaler.(*PeerTLV); ok {
+			if peerTLV.LocalEndpointID == localEpID &&
+				bytes.Equal(peerTLV.PeerNodeID, peerNodeID) &&
+				peerTLV.PeerEndpointID == peerEpID {
+				foundIndex = i
+				break
+			}
 		}
 	}
 
 	if foundIndex != -1 {
 		// Remove the element at foundIndex
-		d.localState.Data[TLVTypePeer] = append(existingTLVs[:foundIndex], existingTLVs[foundIndex+1:]...)
+		d.localState.Data[TLVTypePeer] = append(existingMarshalers[:foundIndex], existingMarshalers[foundIndex+1:]...)
 		// If the slice becomes empty, remove the map entry
 		if len(d.localState.Data[TLVTypePeer]) == 0 {
 			delete(d.localState.Data, TLVTypePeer)
@@ -134,41 +135,40 @@ func (d *DNCP) removeLocalPeerTLV(localEpID EndpointIdentifier, peerNodeID NodeI
 		return true // State changed
 	}
 
-	return false // Matching TLV not found
+	return false // Matching marshaler not found
 }
 
-// removeLocalPeerTLVsForEndpoint removes all Peer TLVs associated with a specific local endpoint.
-// Returns true if any TLVs were removed, false otherwise.
+// removeLocalPeerTLVsForEndpoint removes all Peer TLV marshalers associated with a specific local endpoint.
+// Returns true if any marshalers were removed, false otherwise.
 // Assumes lock is held.
 func (d *DNCP) removeLocalPeerTLVsForEndpoint(localEpID EndpointIdentifier) bool {
-	existingTLVs, exists := d.localState.Data[TLVTypePeer]
-	if !exists || len(existingTLVs) == 0 {
+	existingMarshalers, exists := d.localState.Data[TLVTypePeer]
+	if !exists || len(existingMarshalers) == 0 {
 		return false // Nothing to remove
 	}
 
-	originalLength := len(existingTLVs)
-	newTLVs := make([]*TLV, 0, originalLength)
+	originalLength := len(existingMarshalers)
+	newMarshalers := make([]TLVMarshaler, 0, originalLength)
 
-	for _, tlv := range existingTLVs {
-		decodedTLV, err := DecodePeerTLV(tlv, d.profile.NodeIdentifierLength)
-		if err != nil {
-			d.logger.Warn("Failed to decode Peer TLV during endpoint removal check", "err", err)
-			newTLVs = append(newTLVs, tlv) // Keep undecodable TLV? Or discard? Keep for now.
-			continue
-		}
-		// Keep TLV only if it's NOT for the endpoint being removed
-		if decodedTLV.LocalEndpointID != localEpID {
-			newTLVs = append(newTLVs, tlv)
+	for _, marshaler := range existingMarshalers {
+		if peerTLV, ok := marshaler.(*PeerTLV); ok {
+			// Keep TLV only if it's NOT for the endpoint being removed
+			if peerTLV.LocalEndpointID != localEpID {
+				newMarshalers = append(newMarshalers, marshaler)
+			}
+		} else {
+			// Keep non-PeerTLV marshalers if they somehow ended up here?
+			newMarshalers = append(newMarshalers, marshaler)
 		}
 	}
 
-	if len(newTLVs) < originalLength {
-		if len(newTLVs) == 0 {
+	if len(newMarshalers) < originalLength {
+		if len(newMarshalers) == 0 {
 			delete(d.localState.Data, TLVTypePeer)
 		} else {
-			d.localState.Data[TLVTypePeer] = newTLVs
+			d.localState.Data[TLVTypePeer] = newMarshalers
 		}
-		d.logger.Debug("Removed Peer TLVs for local endpoint", "localEpID", localEpID, "removedCount", originalLength-len(newTLVs))
+		d.logger.Debug("Removed Peer TLVs for local endpoint", "localEpID", localEpID, "removedCount", originalLength-len(newMarshalers))
 		return true // State changed
 	}
 

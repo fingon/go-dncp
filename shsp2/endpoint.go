@@ -79,27 +79,27 @@ func (ep *Endpoint) publishLocalURLsLocked() error {
 		return ep.unpublishLocalURLsLocked()
 	}
 
-	urlTLVs := make([]*dncp.TLV, 0, len(ep.localURLs))
+	urlMarshalers := make([]dncp.TLVMarshaler, 0, len(ep.localURLs))
 	for _, urlStr := range ep.localURLs {
-		tlv, err := NewURLTLV(urlStr)
+		marshaler, err := NewURLTLV(urlStr) // Creates *URLTLV which implements TLVMarshaler
 		if err != nil {
 			// Should not happen if URL generation is correct
-			ep.logger.Error("Failed to create URL TLV", "url", urlStr, "err", err)
+			ep.logger.Error("Failed to create URL TLV marshaler", "url", urlStr, "err", err)
 			continue // Skip this URL
 		}
-		urlTLVs = append(urlTLVs, tlv)
+		urlMarshalers = append(urlMarshalers, marshaler)
 	}
 
-	if len(urlTLVs) == 0 {
-		ep.logger.Error("Failed to create any valid URL TLVs")
-		return errors.New("failed to create any valid URL TLVs")
+	if len(urlMarshalers) == 0 {
+		ep.logger.Error("Failed to create any valid URL TLV marshalers")
+		return errors.New("failed to create any valid URL TLV marshalers")
 	}
 
-	ep.logger.Info("Publishing local URLs via DNCP", "count", len(urlTLVs))
-	// Create new NodeData with URL TLVs
+	ep.logger.Info("Publishing local URLs via DNCP", "count", len(urlMarshalers))
+	// Create new NodeData with URL TLV marshalers
 	newData := make(dncp.NodeData)
-	// Add URL TLVs
-	newData[TLVTypeURL] = urlTLVs
+	// Add URL TLV marshalers
+	newData[TLVTypeURL] = urlMarshalers
 	return ep.dncpInstance.PublishData(newData)
 }
 
@@ -168,9 +168,9 @@ func (ep *Endpoint) handleSHSP2Request(w http.ResponseWriter, r *http.Request) {
 	// If there are response TLVs, encode and send them
 	w.Header().Set("Content-Type", "application/octet-stream")
 	var buf bytes.Buffer
-	for _, tlv := range responseTLVs {
-		if err := tlv.Encode(&buf); err != nil {
-			ep.logger.Error("Failed to encode response TLV", "err", err)
+	for _, marshaler := range responseTLVs {
+		if err := dncp.Encode(marshaler, &buf); err != nil { // Use generic Encode
+			ep.logger.Error("Failed to encode response TLV", "type", marshaler.GetType(), "err", err)
 			http.Error(w, "Failed to encode response", http.StatusInternalServerError)
 			return
 		}
@@ -182,8 +182,8 @@ func (ep *Endpoint) handleSHSP2Request(w http.ResponseWriter, r *http.Request) {
 }
 
 // processSHSP2TLVs handles the TLVs received in an SHSP2 HTTP request.
-// It returns any TLVs that should be sent back in the response.
-func (ep *Endpoint) processSHSP2TLVs(data []byte, sourceAddr string, localEpID dncp.EndpointIdentifier) ([]*dncp.TLV, error) {
+// It returns any TLVMarshalers that should be sent back in the response.
+func (ep *Endpoint) processSHSP2TLVs(data []byte, sourceAddr string, localEpID dncp.EndpointIdentifier) ([]dncp.TLVMarshaler, error) {
 	// Use the DNCP instance to process the TLVs
 	// This will handle standard DNCP TLVs like Request Network State, etc.
 	err := ep.dncpInstance.HandleReceivedTLVs(data, sourceAddr, localEpID, false) // isMulticast=false
@@ -196,23 +196,22 @@ func (ep *Endpoint) processSHSP2TLVs(data []byte, sourceAddr string, localEpID d
 	return nil, nil
 }
 
-// findNodeURLs attempts to find URL TLVs for a specific node in the DNCP network.
-// This is a helper method to work around the lack of direct access to node data.
-func (ep *Endpoint) findNodeURLs(targetNodeID dncp.NodeIdentifier) ([]*dncp.TLV, error) {
-	// Get the node data from DNCP
+// findNodeURLs attempts to find URL TLV marshalers for a specific node in the DNCP network.
+func (ep *Endpoint) findNodeURLs(targetNodeID dncp.NodeIdentifier) ([]dncp.TLVMarshaler, error) {
+	// Get the node data from DNCP (returns map[TLVType][]TLVMarshaler)
 	nodeData, err := ep.dncpInstance.GetNodeData(targetNodeID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get node data for %x: %w", targetNodeID, err)
 	}
 
-	// Extract URL TLVs from the node data
-	urlTLVs, ok := nodeData[TLVTypeURL]
-	if !ok || len(urlTLVs) == 0 {
+	// Extract URL TLV marshalers from the node data
+	urlMarshalers, ok := nodeData[TLVTypeURL]
+	if !ok || len(urlMarshalers) == 0 {
 		return nil, fmt.Errorf("node %x has not published any URL TLVs", targetNodeID)
 	}
 
-	ep.logger.Debug("Found URL TLVs for node", "targetNodeID", fmt.Sprintf("%x", targetNodeID), "count", len(urlTLVs))
-	return urlTLVs, nil
+	ep.logger.Debug("Found URL TLV marshalers for node", "targetNodeID", fmt.Sprintf("%x", targetNodeID), "count", len(urlMarshalers))
+	return urlMarshalers, nil
 }
 
 // startMulticastLocked initializes and starts the multicast listener.
@@ -330,10 +329,16 @@ func (ep *Endpoint) multicastListener() {
 func (ep *Endpoint) handleMulticastPacket(data []byte, src *net.UDPAddr) {
 	ep.logger.Debug("Received multicast packet", "from", src.String(), "size", len(data))
 
-	// Process the TLVs in the packet
+	// Process the TLVs in the packet using profile context
 	// According to the spec, multicast should contain TLV 768 (URL TLV)
 	reader := bytes.NewReader(data)
-	tlvs, err := dncp.DecodeAll(reader)
+	// Need the profile from the DNCP instance
+	profile := ep.dncpInstance.GetProfile() // Assuming GetProfile() exists
+	if profile == nil {
+		ep.logger.Error("Cannot process multicast packet, DNCP profile is nil")
+		return
+	}
+	tlvMarshalers, err := dncp.DecodeAll(reader, profile)
 	if err != nil {
 		ep.logger.Error("Failed to decode TLVs from multicast packet", "err", err)
 		return
@@ -341,18 +346,15 @@ func (ep *Endpoint) handleMulticastPacket(data []byte, src *net.UDPAddr) {
 
 	// Extract source node information and URL TLVs
 	var sourceNodeID dncp.NodeIdentifier
-	var urlTLVs []*dncp.TLV
+	var urlMarshalers []dncp.TLVMarshaler
 
-	for _, tlv := range tlvs {
-		switch tlv.Type {
-		case dncp.TLVTypeNodeEndpoint:
+	for _, marshaler := range tlvMarshalers {
+		switch specificTLV := marshaler.(type) {
+		case *dncp.NodeEndpointTLV:
 			// Extract node ID from NodeEndpoint TLV
-			// For SHSP2, we know the node ID length is 4 bytes (32 bits) per spec
-			if len(tlv.Value) >= 4 { // Minimum size for NodeEndpoint TLV
-				sourceNodeID = tlv.Value[:SHSP2NodeIdentifierLength]
-			}
-		case TLVTypeURL:
-			urlTLVs = append(urlTLVs, tlv)
+			sourceNodeID = specificTLV.NodeID
+		case *URLTLV:
+			urlMarshalers = append(urlMarshalers, specificTLV)
 		}
 	}
 
@@ -361,22 +363,19 @@ func (ep *Endpoint) handleMulticastPacket(data []byte, src *net.UDPAddr) {
 		return
 	}
 
-	if len(urlTLVs) == 0 {
+	if len(urlMarshalers) == 0 {
 		ep.logger.Warn("Received multicast packet without URL TLVs",
 			"sourceNodeID", fmt.Sprintf("%x", sourceNodeID))
-		return
+		// Still process other TLVs via HandleReceivedTLVs below
 	}
 
 	// Log the URLs received
-	for _, tlv := range urlTLVs {
-		urlTLV, err := DecodeURLTLV(tlv)
-		if err != nil {
-			ep.logger.Warn("Failed to decode URL TLV", "err", err)
-			continue
+	for _, marshaler := range urlMarshalers {
+		if urlTLV, ok := marshaler.(*URLTLV); ok {
+			ep.logger.Debug("Received URL in multicast",
+				"sourceNodeID", fmt.Sprintf("%x", sourceNodeID),
+				"url", urlTLV.URL)
 		}
-		ep.logger.Debug("Received URL in multicast",
-			"sourceNodeID", fmt.Sprintf("%x", sourceNodeID),
-			"url", urlTLV.URL)
 	}
 
 	// Pass the TLVs to DNCP for processing
@@ -406,27 +405,23 @@ func (ep *Endpoint) sendMulticastAnnouncementLocked() error {
 	var buf bytes.Buffer
 
 	// Add NodeEndpoint TLV first (required by DNCP for datagrams)
-	// We need to create a NodeEndpoint TLV with our node ID
 	nodeID := ep.dncpInstance.GetNodeID()
-
-	// Create NodeEndpoint TLV using the helper method
-	nodeEndpointTLV, err := dncp.NewNodeEndpointTLV(nodeID, ep.config.EndpointID, SHSP2NodeIdentifierLength)
+	nodeEpMarshaler, err := dncp.NewNodeEndpointTLV(nodeID, ep.config.EndpointID)
 	if err != nil {
 		return fmt.Errorf("failed to create NodeEndpoint TLV: %w", err)
 	}
-	if err := nodeEndpointTLV.Encode(&buf); err != nil {
+	if err := dncp.Encode(nodeEpMarshaler, &buf); err != nil { // Use generic Encode
 		return fmt.Errorf("failed to encode NodeEndpoint TLV: %w", err)
 	}
 
 	// Add URL TLVs
 	for _, urlStr := range ep.localURLs {
-		urlTLV, err := NewURLTLV(urlStr)
+		urlMarshaler, err := NewURLTLV(urlStr)
 		if err != nil {
 			ep.logger.Warn("Failed to create URL TLV for multicast", "url", urlStr, "err", err)
 			continue
 		}
-
-		if err := urlTLV.Encode(&buf); err != nil {
+		if err := dncp.Encode(urlMarshaler, &buf); err != nil { // Use generic Encode
 			ep.logger.Warn("Failed to encode URL TLV for multicast", "url", urlStr, "err", err)
 			continue
 		}

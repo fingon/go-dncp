@@ -1,338 +1,455 @@
 package dncp
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"time"
 )
 
-// --- Specific TLV Structs and Constructors/Decoders ---
+// --- Initialization: Register Standard TLV Types ---
+
+func init() {
+	RegisterTLVType(TLVTypeRequestNetworkState, func() TLVMarshaler {
+		return &RequestNetworkStateTLV{BaseTLV: BaseTLV{TLVType: TLVTypeRequestNetworkState}}
+	})
+	RegisterTLVType(TLVTypeRequestNodeState, func() TLVMarshaler { return &RequestNodeStateTLV{BaseTLV: BaseTLV{TLVType: TLVTypeRequestNodeState}} })
+	RegisterTLVType(TLVTypeNodeEndpoint, func() TLVMarshaler { return &NodeEndpointTLV{BaseTLV: BaseTLV{TLVType: TLVTypeNodeEndpoint}} })
+	RegisterTLVType(TLVTypeNetworkState, func() TLVMarshaler { return &NetworkStateTLV{BaseTLV: BaseTLV{TLVType: TLVTypeNetworkState}} })
+	RegisterTLVType(TLVTypeNodeState, func() TLVMarshaler { return &NodeStateTLV{BaseTLV: BaseTLV{TLVType: TLVTypeNodeState}} })
+	RegisterTLVType(TLVTypePeer, func() TLVMarshaler { return &PeerTLV{BaseTLV: BaseTLV{TLVType: TLVTypePeer}} })
+	RegisterTLVType(TLVTypeKeepAliveInterval, func() TLVMarshaler { return &KeepAliveIntervalTLV{BaseTLV: BaseTLV{TLVType: TLVTypeKeepAliveInterval}} })
+	// Register TLVTypeTrustVerdict later if implemented
+}
 
 // --- Request TLVs (Section 7.1) ---
 
 // RequestNetworkStateTLV corresponds to TLV Type 1. It has no value.
-type RequestNetworkStateTLV struct{} // No fields needed
-
-// NewRequestNetworkStateTLV creates a new Request Network State TLV.
-func NewRequestNetworkStateTLV() *TLV {
-	return &TLV{Type: TLVTypeRequestNetworkState, Length: 0, Value: []byte{}}
+type RequestNetworkStateTLV struct {
+	BaseTLV
 }
 
-// DecodeRequestNetworkStateTLV validates a generic TLV as RequestNetworkState.
-func DecodeRequestNetworkStateTLV(tlv *TLV) (*RequestNetworkStateTLV, error) {
-	if tlv.Type != TLVTypeRequestNetworkState {
-		return nil, fmt.Errorf("invalid type for RequestNetworkState: %d", tlv.Type)
+// EncodeValue returns an empty byte slice as this TLV has no value.
+func (t *RequestNetworkStateTLV) EncodeValue() ([]byte, error) {
+	return []byte{}, nil
+}
+
+// DecodeValue does nothing as this TLV has no value. The profile arg is ignored.
+func (t *RequestNetworkStateTLV) DecodeValue(value []byte, _ *Profile) error {
+	if len(value) != 0 {
+		return fmt.Errorf("%w: expected length 0 for RequestNetworkState, got %d", ErrInvalidTLVLength, len(value))
 	}
-	if tlv.Length != 0 {
-		return nil, fmt.Errorf("%w: expected length 0 for RequestNetworkState, got %d", ErrInvalidTLVLength, tlv.Length)
-	}
-	return &RequestNetworkStateTLV{}, nil
+	return nil
 }
 
 // RequestNodeStateTLV corresponds to TLV Type 2.
 type RequestNodeStateTLV struct {
+	BaseTLV
 	NodeID NodeIdentifier
 }
 
-// NewRequestNodeStateTLV creates a new Request Node State TLV.
-func NewRequestNodeStateTLV(nodeID NodeIdentifier, expectedLen uint) (*TLV, error) {
-	if len(nodeID) != int(expectedLen) {
-		return nil, fmt.Errorf("%w: invalid NodeID length %d for profile length %d", ErrInvalidTLVLength, len(nodeID), expectedLen)
-	}
-	return &TLV{
-		Type:   TLVTypeRequestNodeState,
-		Length: uint16(len(nodeID)),
-		Value:  slices.Clone(nodeID),
+// NewRequestNodeStateTLV creates a new Request Node State TLV instance.
+func NewRequestNodeStateTLV(nodeID NodeIdentifier) (*RequestNodeStateTLV, error) {
+	// Length validation happens during encoding or based on profile during decoding
+	return &RequestNodeStateTLV{
+		BaseTLV: BaseTLV{TLVType: TLVTypeRequestNodeState},
+		NodeID:  slices.Clone(nodeID),
 	}, nil
 }
 
-// DecodeRequestNodeStateTLV decodes the Request Node State TLV value.
-func DecodeRequestNodeStateTLV(tlv *TLV, expectedLen uint) (*RequestNodeStateTLV, error) {
-	if tlv.Type != TLVTypeRequestNodeState {
-		return nil, fmt.Errorf("invalid type for RequestNodeState: %d", tlv.Type)
+// EncodeValue returns the NodeID bytes.
+// Note: Length validation against profile should happen in the caller if needed,
+// or rely on the Decode side validation. For simplicity, encode what's given.
+func (t *RequestNodeStateTLV) EncodeValue() ([]byte, error) {
+	return slices.Clone(t.NodeID), nil
+}
+
+// DecodeValue decodes the NodeID from the value bytes, validating length against the profile.
+func (t *RequestNodeStateTLV) DecodeValue(value []byte, profile *Profile) error {
+	if profile == nil {
+		return errors.New("profile is required for decoding RequestNodeStateTLV")
 	}
-	if tlv.Length != uint16(expectedLen) {
-		return nil, fmt.Errorf("%w: expected length %d for RequestNodeState, got %d", ErrInvalidTLVLength, expectedLen, tlv.Length)
+	expectedLen := profile.NodeIdentifierLength
+	if len(value) != int(expectedLen) {
+		return fmt.Errorf("%w: expected length %d for RequestNodeState, got %d", ErrInvalidTLVLength, expectedLen, len(value))
 	}
-	if len(tlv.Value) != int(expectedLen) {
-		// This check should be redundant if Encode/Decode work correctly, but good practice.
-		return nil, fmt.Errorf("%w: internal inconsistency, value length %d != header length %d", ErrInvalidTLVLength, len(tlv.Value), tlv.Length)
+	if len(value) == 0 {
+		return fmt.Errorf("%w: value cannot be empty for RequestNodeState", ErrInvalidTLVLength)
 	}
-	return &RequestNodeStateTLV{
-		NodeID: slices.Clone(tlv.Value),
-	}, nil
+	t.NodeID = slices.Clone(value)
+	return nil
 }
 
 // --- Data TLVs (Section 7.2) ---
 
 // NodeEndpointTLV corresponds to TLV Type 3.
 type NodeEndpointTLV struct {
+	BaseTLV
 	NodeID     NodeIdentifier
 	EndpointID EndpointIdentifier
 }
 
-// NewNodeEndpointTLV creates a new Node Endpoint TLV.
-func NewNodeEndpointTLV(nodeID NodeIdentifier, endpointID EndpointIdentifier, nodeIDLen uint) (*TLV, error) {
-	if len(nodeID) != int(nodeIDLen) {
-		return nil, fmt.Errorf("%w: invalid NodeID length %d for profile length %d", ErrInvalidTLVLength, len(nodeID), nodeIDLen)
-	}
-	valueLen := int(nodeIDLen) + 4 // NodeID + EndpointID (uint32)
-	value := make([]byte, valueLen)
-	copy(value[0:nodeIDLen], nodeID)
-	binary.BigEndian.PutUint32(value[nodeIDLen:valueLen], uint32(endpointID))
-
-	return &TLV{
-		Type:   TLVTypeNodeEndpoint,
-		Length: uint16(valueLen),
-		Value:  value,
+// NewNodeEndpointTLV creates a new Node Endpoint TLV instance.
+func NewNodeEndpointTLV(nodeID NodeIdentifier, endpointID EndpointIdentifier) (*NodeEndpointTLV, error) {
+	return &NodeEndpointTLV{
+		BaseTLV:    BaseTLV{TLVType: TLVTypeNodeEndpoint},
+		NodeID:     slices.Clone(nodeID),
+		EndpointID: endpointID,
 	}, nil
 }
 
-// DecodeNodeEndpointTLV decodes the Node Endpoint TLV value.
-func DecodeNodeEndpointTLV(tlv *TLV, nodeIDLen uint) (*NodeEndpointTLV, error) {
-	if tlv.Type != TLVTypeNodeEndpoint {
-		return nil, fmt.Errorf("invalid type for NodeEndpoint: %d", tlv.Type)
-	}
-	expectedLen := nodeIDLen + 4
-	if tlv.Length != uint16(expectedLen) {
-		return nil, fmt.Errorf("%w: expected length %d for NodeEndpoint, got %d", ErrInvalidTLVLength, expectedLen, tlv.Length)
-	}
-	if uint(len(tlv.Value)) != expectedLen {
-		return nil, fmt.Errorf("%w: internal inconsistency, value length %d != header length %d", ErrInvalidTLVLength, len(tlv.Value), tlv.Length)
-	}
+// EncodeValue encodes NodeID and EndpointID.
+func (t *NodeEndpointTLV) EncodeValue() ([]byte, error) {
+	// Length validation against profile should happen elsewhere if needed.
+	nodeIDLen := len(t.NodeID) // Use actual length of stored NodeID
+	valueLen := nodeIDLen + 4  // NodeID + EndpointID (uint32)
+	value := make([]byte, valueLen)
+	copy(value[0:nodeIDLen], t.NodeID)
+	binary.BigEndian.PutUint32(value[nodeIDLen:valueLen], uint32(t.EndpointID))
+	return value, nil
+}
 
-	return &NodeEndpointTLV{
-		NodeID:     slices.Clone(tlv.Value[0:nodeIDLen]),
-		EndpointID: EndpointIdentifier(binary.BigEndian.Uint32(tlv.Value[nodeIDLen:expectedLen])),
-	}, nil
+// DecodeValue decodes NodeID and EndpointID, validating length against the profile.
+func (t *NodeEndpointTLV) DecodeValue(value []byte, profile *Profile) error {
+	if profile == nil {
+		return errors.New("profile is required for decoding NodeEndpointTLV")
+	}
+	nodeIDLen := profile.NodeIdentifierLength
+	expectedLen := int(nodeIDLen) + 4
+	if len(value) != expectedLen {
+		return fmt.Errorf("%w: expected length %d for NodeEndpoint, got %d", ErrInvalidTLVLength, expectedLen, len(value))
+	}
+	t.NodeID = slices.Clone(value[0:nodeIDLen])
+	t.EndpointID = EndpointIdentifier(binary.BigEndian.Uint32(value[nodeIDLen:expectedLen]))
+	return nil
 }
 
 // NetworkStateTLV corresponds to TLV Type 4.
 type NetworkStateTLV struct {
+	BaseTLV
 	NetworkStateHash []byte
 }
 
-// NewNetworkStateTLV creates a new Network State TLV.
-func NewNetworkStateTLV(hash []byte, hashLen uint) (*TLV, error) {
-	if len(hash) != int(hashLen) {
-		return nil, fmt.Errorf("%w: invalid hash length %d for profile length %d", ErrInvalidTLVLength, len(hash), hashLen)
-	}
-	return &TLV{
-		Type:   TLVTypeNetworkState,
-		Length: uint16(len(hash)),
-		Value:  slices.Clone(hash),
+// NewNetworkStateTLV creates a new Network State TLV instance.
+func NewNetworkStateTLV(hash []byte) (*NetworkStateTLV, error) {
+	return &NetworkStateTLV{
+		BaseTLV:          BaseTLV{TLVType: TLVTypeNetworkState},
+		NetworkStateHash: slices.Clone(hash),
 	}, nil
 }
 
-// DecodeNetworkStateTLV decodes the Network State TLV value.
-func DecodeNetworkStateTLV(tlv *TLV, hashLen uint) (*NetworkStateTLV, error) {
-	if tlv.Type != TLVTypeNetworkState {
-		return nil, fmt.Errorf("invalid type for NetworkState: %d", tlv.Type)
+// EncodeValue returns the NetworkStateHash bytes.
+func (t *NetworkStateTLV) EncodeValue() ([]byte, error) {
+	// Length validation against profile should happen elsewhere if needed.
+	return slices.Clone(t.NetworkStateHash), nil
+}
+
+// DecodeValue decodes the NetworkStateHash, validating length against the profile.
+func (t *NetworkStateTLV) DecodeValue(value []byte, profile *Profile) error {
+	if profile == nil {
+		return errors.New("profile is required for decoding NetworkStateTLV")
 	}
-	if tlv.Length != uint16(hashLen) {
-		return nil, fmt.Errorf("%w: expected length %d for NetworkState hash, got %d", ErrInvalidTLVLength, hashLen, tlv.Length)
+	hashLen := profile.HashLength
+	if len(value) != int(hashLen) {
+		return fmt.Errorf("%w: expected length %d for NetworkState hash, got %d", ErrInvalidTLVLength, hashLen, len(value))
 	}
-	if uint(len(tlv.Value)) != hashLen {
-		return nil, fmt.Errorf("%w: internal inconsistency, value length %d != header length %d", ErrInvalidTLVLength, len(tlv.Value), tlv.Length)
-	}
-	return &NetworkStateTLV{
-		NetworkStateHash: slices.Clone(tlv.Value),
-	}, nil
+	t.NetworkStateHash = slices.Clone(value)
+	return nil
 }
 
 // NodeStateTLV corresponds to TLV Type 5.
 type NodeStateTLV struct {
+	BaseTLV
 	NodeID                       NodeIdentifier
 	SequenceNumber               uint32
 	MillisecondsSinceOrigination uint32
 	DataHash                     []byte
-	NodeData                     []byte // Optional raw bytes of nested TLVs
+	NestedTLVs                   []TLVMarshaler // Decoded nested TLVs
 }
 
-// NewNodeStateTLV creates a new Node State TLV.
-// nodeData should be the already encoded byte stream of nested TLVs, or nil.
-func NewNodeStateTLV(nodeID NodeIdentifier, seqNum, msSinceOrig uint32, dataHash, nodeData []byte, nodeIDLen, hashLen uint) (*TLV, error) {
-	if len(nodeID) != int(nodeIDLen) {
-		return nil, fmt.Errorf("%w: invalid NodeID length %d for profile length %d", ErrInvalidTLVLength, len(nodeID), nodeIDLen)
-	}
-	if len(dataHash) != int(hashLen) {
-		return nil, fmt.Errorf("%w: invalid DataHash length %d for profile length %d", ErrInvalidTLVLength, len(dataHash), hashLen)
-	}
-
-	fixedPartLen := int(nodeIDLen) + 4 + 4 + int(hashLen) // NodeID + SeqNum + MsSinceOrig + DataHash
-	valueLen := fixedPartLen + len(nodeData)
-	if valueLen > MaxTLVValueLength {
-		return nil, fmt.Errorf("%w: total NodeState value length %d exceeds maximum %d", ErrInvalidTLVLength, valueLen, MaxTLVValueLength)
-	}
-
-	value := make([]byte, valueLen)
-	offset := 0
-	copy(value[offset:offset+int(nodeIDLen)], nodeID)
-	offset += int(nodeIDLen)
-	binary.BigEndian.PutUint32(value[offset:offset+4], seqNum)
-	offset += 4
-	binary.BigEndian.PutUint32(value[offset:offset+4], msSinceOrig)
-	offset += 4
-	copy(value[offset:offset+int(hashLen)], dataHash)
-	offset += int(hashLen)
-	if len(nodeData) > 0 {
-		copy(value[offset:], nodeData)
-	}
-
-	return &TLV{
-		Type:   TLVTypeNodeState,
-		Length: uint16(valueLen),
-		Value:  value,
-	}, nil
-}
-
-// DecodeNodeStateTLV decodes the Node State TLV value.
-// The NodeData field remains as raw bytes for further decoding if needed.
-func DecodeNodeStateTLV(tlv *TLV, nodeIDLen, hashLen uint) (*NodeStateTLV, error) {
-	if tlv.Type != TLVTypeNodeState {
-		return nil, fmt.Errorf("invalid type for NodeState: %d", tlv.Type)
-	}
-	fixedPartLen := int(nodeIDLen) + 4 + 4 + int(hashLen)
-	if tlv.Length < uint16(fixedPartLen) {
-		return nil, fmt.Errorf("%w: length %d too short for NodeState fixed fields (%d)", ErrInvalidTLVLength, tlv.Length, fixedPartLen)
-	}
-	if len(tlv.Value) != int(tlv.Length) {
-		return nil, fmt.Errorf("%w: internal inconsistency, value length %d != header length %d", ErrInvalidTLVLength, len(tlv.Value), tlv.Length)
-	}
-
-	offset := 0
-	nodeID := slices.Clone(tlv.Value[offset : offset+int(nodeIDLen)])
-	offset += int(nodeIDLen)
-	seqNum := binary.BigEndian.Uint32(tlv.Value[offset : offset+4])
-	offset += 4
-	msSinceOrig := binary.BigEndian.Uint32(tlv.Value[offset : offset+4])
-	offset += 4
-	dataHash := slices.Clone(tlv.Value[offset : offset+int(hashLen)])
-	offset += int(hashLen)
-
-	var nodeData []byte
-	if offset < len(tlv.Value) {
-		nodeData = slices.Clone(tlv.Value[offset:])
-	}
-
+// NewNodeStateTLV creates a new Node State TLV instance.
+// nestedTLVs should be the list of TLVMarshaler instances to include.
+func NewNodeStateTLV(nodeID NodeIdentifier, seqNum, msSinceOrig uint32, dataHash []byte, nestedTLVs []TLVMarshaler) (*NodeStateTLV, error) {
+	// Length validation happens during encoding/decoding based on profile
 	return &NodeStateTLV{
-		NodeID:                       nodeID,
+		BaseTLV:                      BaseTLV{TLVType: TLVTypeNodeState},
+		NodeID:                       slices.Clone(nodeID),
 		SequenceNumber:               seqNum,
 		MillisecondsSinceOrigination: msSinceOrig,
-		DataHash:                     dataHash,
-		NodeData:                     nodeData,
+		DataHash:                     slices.Clone(dataHash),
+		NestedTLVs:                   nestedTLVs, // Store the slice directly
 	}, nil
+}
+
+// EncodeValue encodes the fixed fields and the nested TLVs.
+func (t *NodeStateTLV) EncodeValue() ([]byte, error) {
+	// Length validation against profile should happen elsewhere if needed.
+	nodeIDLen := len(t.NodeID)
+	hashLen := len(t.DataHash)
+	fixedPartLen := nodeIDLen + 4 + 4 + hashLen // NodeID + SeqNum + MsSinceOrig + DataHash
+
+	// Encode nested TLVs, sort them by binary representation, then concatenate
+	var nestedBytes []byte
+	if len(t.NestedTLVs) > 0 {
+		// Create temporary structure to hold encoded TLVs for sorting
+		encodedNested := make([]encodedTLV, 0, len(t.NestedTLVs))
+		var encBuf bytes.Buffer
+		for _, nestedTLV := range t.NestedTLVs {
+			encBuf.Reset()
+			if err := Encode(nestedTLV, &encBuf); err != nil {
+				return nil, fmt.Errorf("failed to encode nested TLV type %d for sorting: %w", nestedTLV.GetType(), err)
+			}
+			encodedNested = append(encodedNested, encodedTLV{
+				marshaler: nestedTLV,
+				encoded:   slices.Clone(encBuf.Bytes()),
+			})
+		}
+
+		// Sort based on encoded binary content
+		slices.SortFunc(encodedNested, func(a, b encodedTLV) int {
+			return bytes.Compare(a.encoded, b.encoded)
+		})
+
+		// Concatenate sorted encoded TLVs
+		var finalNestedBuf bytes.Buffer
+		for _, et := range encodedNested {
+			if _, err := finalNestedBuf.Write(et.encoded); err != nil {
+				// Should not happen with bytes.Buffer
+				return nil, fmt.Errorf("failed to write sorted nested TLV type %d to buffer: %w", et.marshaler.GetType(), err)
+			}
+		}
+		nestedBytes = finalNestedBuf.Bytes()
+	}
+
+	valueLen := fixedPartLen + len(nestedBytes)
+
+	// Create final value buffer
+	value := make([]byte, valueLen)
+	offset := 0
+	copy(value[offset:offset+nodeIDLen], t.NodeID)
+	offset += nodeIDLen
+	binary.BigEndian.PutUint32(value[offset:offset+4], t.SequenceNumber)
+	offset += 4
+	binary.BigEndian.PutUint32(value[offset:offset+4], t.MillisecondsSinceOrigination)
+	offset += 4
+	copy(value[offset:offset+hashLen], t.DataHash)
+	offset += hashLen
+	if len(nestedBytes) > 0 {
+		copy(value[offset:], nestedBytes)
+	}
+
+	return value, nil
+}
+
+// DecodeValue decodes the fixed fields and attempts to decode nested TLVs using the profile context.
+func (t *NodeStateTLV) DecodeValue(value []byte, profile *Profile) error {
+	if profile == nil {
+		return errors.New("profile is required for decoding NodeStateTLV")
+	}
+	nodeIDLen := profile.NodeIdentifierLength
+	hashLen := profile.HashLength
+	fixedPartLen := int(nodeIDLen) + 4 + 4 + int(hashLen)
+	if len(value) < fixedPartLen {
+		return fmt.Errorf("%w: length %d too short for NodeState fixed fields (%d)", ErrInvalidTLVLength, len(value), fixedPartLen)
+	}
+
+	offset := 0
+	t.NodeID = slices.Clone(value[offset : offset+int(nodeIDLen)])
+	offset += int(nodeIDLen)
+	t.SequenceNumber = binary.BigEndian.Uint32(value[offset : offset+4])
+	offset += 4
+	t.MillisecondsSinceOrigination = binary.BigEndian.Uint32(value[offset : offset+4])
+	offset += 4
+	t.DataHash = slices.Clone(value[offset : offset+int(hashLen)])
+	offset += int(hashLen)
+
+	// Decode nested TLVs if present
+	if offset < len(value) {
+		nestedBytes := value[offset:]
+		nestedReader := bytes.NewReader(nestedBytes)
+		// Pass profile to DecodeAll for nested decoding
+		decodedNested, err := DecodeAll(nestedReader, profile)
+		if err != nil && !errors.Is(err, io.EOF) { // EOF is expected if DecodeAll reads everything
+			return fmt.Errorf("failed to decode nested TLVs: %w", err)
+		}
+		// Check if all bytes were consumed
+		if nestedReader.Len() > 0 {
+			return fmt.Errorf("trailing data (%d bytes) after decoding nested TLVs", nestedReader.Len())
+		}
+		t.NestedTLVs = decodedNested
+	} else {
+		t.NestedTLVs = nil // No nested data
+	}
+
+	return nil
+}
+
+// GetSubTLVs returns the decoded nested TLVs.
+func (t *NodeStateTLV) GetSubTLVs() []TLVMarshaler {
+	return t.NestedTLVs
+}
+
+// SetSubTLVs sets the nested TLVs.
+func (t *NodeStateTLV) SetSubTLVs(subTLVs []TLVMarshaler) error {
+	t.NestedTLVs = subTLVs
+	return nil
 }
 
 // --- Data TLVs within Node State TLV (Section 7.3) ---
 
 // PeerTLV corresponds to TLV Type 8.
 type PeerTLV struct {
+	BaseTLV
 	PeerNodeID      NodeIdentifier
 	PeerEndpointID  EndpointIdentifier
 	LocalEndpointID EndpointIdentifier // Renamed from "(Local) Endpoint Identifier" for clarity
 }
 
-// NewPeerTLV creates a new Peer TLV.
-func NewPeerTLV(peerNodeID NodeIdentifier, peerEpID, localEpID EndpointIdentifier, nodeIDLen uint) (*TLV, error) {
-	if len(peerNodeID) != int(nodeIDLen) {
-		return nil, fmt.Errorf("%w: invalid PeerNodeID length %d for profile length %d", ErrInvalidTLVLength, len(peerNodeID), nodeIDLen)
-	}
-	valueLen := int(nodeIDLen) + 4 + 4 // PeerNodeID + PeerEpID + LocalEpID
-	value := make([]byte, valueLen)
-	offset := 0
-	copy(value[offset:offset+int(nodeIDLen)], peerNodeID)
-	offset += int(nodeIDLen)
-	binary.BigEndian.PutUint32(value[offset:offset+4], uint32(peerEpID))
-	offset += 4
-	binary.BigEndian.PutUint32(value[offset:offset+4], uint32(localEpID))
-
-	return &TLV{
-		Type:   TLVTypePeer,
-		Length: uint16(valueLen),
-		Value:  value,
-	}, nil
-}
-
-// DecodePeerTLV decodes the Peer TLV value.
-func DecodePeerTLV(tlv *TLV, nodeIDLen uint) (*PeerTLV, error) {
-	if tlv.Type != TLVTypePeer {
-		return nil, fmt.Errorf("invalid type for Peer: %d", tlv.Type)
-	}
-	expectedLen := nodeIDLen + 4 + 4
-	if tlv.Length != uint16(expectedLen) {
-		return nil, fmt.Errorf("%w: expected length %d for Peer, got %d", ErrInvalidTLVLength, expectedLen, tlv.Length)
-	}
-	if uint(len(tlv.Value)) != expectedLen {
-		return nil, fmt.Errorf("%w: internal inconsistency, value length %d != header length %d", ErrInvalidTLVLength, len(tlv.Value), tlv.Length)
-	}
-
-	offset := 0
-	peerNodeID := slices.Clone(tlv.Value[offset : offset+int(nodeIDLen)])
-	offset += int(nodeIDLen)
-	peerEpID := EndpointIdentifier(binary.BigEndian.Uint32(tlv.Value[offset : offset+4]))
-	offset += 4
-	localEpID := EndpointIdentifier(binary.BigEndian.Uint32(tlv.Value[offset : offset+4]))
-
+// NewPeerTLV creates a new Peer TLV instance.
+func NewPeerTLV(peerNodeID NodeIdentifier, peerEpID, localEpID EndpointIdentifier) (*PeerTLV, error) {
 	return &PeerTLV{
-		PeerNodeID:      peerNodeID,
+		BaseTLV:         BaseTLV{TLVType: TLVTypePeer},
+		PeerNodeID:      slices.Clone(peerNodeID),
 		PeerEndpointID:  peerEpID,
 		LocalEndpointID: localEpID,
 	}, nil
 }
 
-// KeepAliveIntervalTLV corresponds to TLV Type 9.
-type KeepAliveIntervalTLV struct {
-	EndpointID EndpointIdentifier // 0 means default for all endpoints without specific TLV
-	Interval   uint32             // Interval in milliseconds, 0 means no keep-alives sent
+// EncodeValue encodes the Peer TLV fields.
+func (t *PeerTLV) EncodeValue() ([]byte, error) {
+	// Length validation against profile should happen elsewhere if needed.
+	nodeIDLen := len(t.PeerNodeID)
+	valueLen := nodeIDLen + 4 + 4 // PeerNodeID + PeerEpID + LocalEpID
+	value := make([]byte, valueLen)
+	offset := 0
+	copy(value[offset:offset+nodeIDLen], t.PeerNodeID)
+	offset += nodeIDLen
+	binary.BigEndian.PutUint32(value[offset:offset+4], uint32(t.PeerEndpointID))
+	offset += 4
+	binary.BigEndian.PutUint32(value[offset:offset+4], uint32(t.LocalEndpointID))
+	return value, nil
 }
 
-// NewKeepAliveIntervalTLV creates a new Keep-Alive Interval TLV.
-func NewKeepAliveIntervalTLV(endpointID EndpointIdentifier, interval time.Duration) (*TLV, error) {
-	valueLen := 4 + 4 // EndpointID + Interval
-	value := make([]byte, valueLen)
+// DecodeValue decodes the Peer TLV fields, validating length against the profile.
+func (t *PeerTLV) DecodeValue(value []byte, profile *Profile) error {
+	if profile == nil {
+		return errors.New("profile is required for decoding PeerTLV")
+	}
+	nodeIDLen := profile.NodeIdentifierLength
+	expectedLen := int(nodeIDLen) + 4 + 4
+	if len(value) != expectedLen {
+		return fmt.Errorf("%w: expected length %d for Peer, got %d", ErrInvalidTLVLength, expectedLen, len(value))
+	}
+
+	offset := 0
+	t.PeerNodeID = slices.Clone(value[offset : offset+int(nodeIDLen)])
+	offset += int(nodeIDLen)
+	t.PeerEndpointID = EndpointIdentifier(binary.BigEndian.Uint32(value[offset : offset+4]))
+	offset += 4
+	t.LocalEndpointID = EndpointIdentifier(binary.BigEndian.Uint32(value[offset : offset+4]))
+	return nil
+}
+
+// KeepAliveIntervalTLV corresponds to TLV Type 9.
+// This TLV type *can* have sub-TLVs according to RFC 7787 Section 7.
+type KeepAliveIntervalTLV struct {
+	BaseTLV
+	EndpointID EndpointIdentifier // 0 means default for all endpoints without specific TLV
+	IntervalMs uint32             // Interval in milliseconds, 0 means no keep-alives sent
+	SubTLVs    []TLVMarshaler     // Optional nested TLVs
+}
+
+// NewKeepAliveIntervalTLV creates a new Keep-Alive Interval TLV instance.
+func NewKeepAliveIntervalTLV(endpointID EndpointIdentifier, interval time.Duration) (*KeepAliveIntervalTLV, error) {
 	intervalMs := uint32(interval.Milliseconds())
-	// Check for potential overflow if interval is huge? Milliseconds should fit uint32 for ~49 days.
 	if interval > 0 && intervalMs == 0 {
 		return nil, fmt.Errorf("interval %v too small, results in 0 milliseconds", interval)
 	}
 	if interval < 0 {
 		return nil, fmt.Errorf("interval %v cannot be negative", interval)
 	}
-
-	binary.BigEndian.PutUint32(value[0:4], uint32(endpointID))
-	binary.BigEndian.PutUint32(value[4:8], intervalMs)
-
-	return &TLV{
-		Type:   TLVTypeKeepAliveInterval,
-		Length: uint16(valueLen),
-		Value:  value,
+	return &KeepAliveIntervalTLV{
+		BaseTLV:    BaseTLV{TLVType: TLVTypeKeepAliveInterval},
+		EndpointID: endpointID,
+		IntervalMs: intervalMs,
+		// SubTLVs initialized to nil
 	}, nil
 }
 
-// DecodeKeepAliveIntervalTLV decodes the Keep-Alive Interval TLV value.
-func DecodeKeepAliveIntervalTLV(tlv *TLV) (*KeepAliveIntervalTLV, error) {
-	if tlv.Type != TLVTypeKeepAliveInterval {
-		return nil, fmt.Errorf("invalid type for KeepAliveInterval: %d", tlv.Type)
-	}
-	expectedLen := 4 + 4
-	if tlv.Length != uint16(expectedLen) {
-		// Allow >= 8 for potential sub-TLVs? Spec says "Length: >= 8"
-		// Let's stick to exact length for now unless sub-TLVs are defined.
-		// if tlv.Length < uint16(expectedLen) {
-		return nil, fmt.Errorf("%w: expected length %d for KeepAliveInterval, got %d", ErrInvalidTLVLength, expectedLen, tlv.Length)
-		// }
-	}
-	if len(tlv.Value) < expectedLen { // Check value buffer has enough bytes
-		return nil, fmt.Errorf("%w: internal inconsistency, value length %d < expected length %d", ErrInvalidTLVLength, len(tlv.Value), expectedLen)
+// EncodeValue encodes the fixed fields and any nested SubTLVs.
+func (t *KeepAliveIntervalTLV) EncodeValue() ([]byte, error) {
+	fixedPartLen := 4 + 4 // EndpointID + Interval
+	fixedValue := make([]byte, fixedPartLen)
+	binary.BigEndian.PutUint32(fixedValue[0:4], uint32(t.EndpointID))
+	binary.BigEndian.PutUint32(fixedValue[4:8], t.IntervalMs)
+
+	// Encode sub-TLVs if present
+	if len(t.SubTLVs) == 0 {
+		return fixedValue, nil
 	}
 
-	endpointID := EndpointIdentifier(binary.BigEndian.Uint32(tlv.Value[0:4]))
-	intervalMs := binary.BigEndian.Uint32(tlv.Value[4:8])
+	var subTLVBuf bytes.Buffer
+	for _, subTLV := range t.SubTLVs {
+		if err := Encode(subTLV, &subTLVBuf); err != nil {
+			return nil, fmt.Errorf("failed to encode sub-TLV type %d for KeepAliveInterval: %w", subTLV.GetType(), err)
+		}
+	}
+	subTLVBytes := subTLVBuf.Bytes()
 
-	return &KeepAliveIntervalTLV{
-		EndpointID: endpointID,
-		Interval:   intervalMs,
-	}, nil
+	// Concatenate fixed part and encoded sub-TLVs
+	finalValue := make([]byte, 0, fixedPartLen+len(subTLVBytes))
+	finalValue = append(finalValue, fixedValue...)
+	finalValue = append(finalValue, subTLVBytes...)
+	return finalValue, nil
+}
+
+// DecodeValue decodes the fixed fields and attempts to decode sub-TLVs using the profile context.
+func (t *KeepAliveIntervalTLV) DecodeValue(value []byte, profile *Profile) error {
+	if profile == nil {
+		return errors.New("profile is required for decoding KeepAliveIntervalTLV")
+	}
+	fixedPartLen := 4 + 4
+	if len(value) < fixedPartLen {
+		return fmt.Errorf("%w: expected length >= %d for KeepAliveInterval, got %d", ErrInvalidTLVLength, fixedPartLen, len(value))
+	}
+
+	t.EndpointID = EndpointIdentifier(binary.BigEndian.Uint32(value[0:4]))
+	t.IntervalMs = binary.BigEndian.Uint32(value[4:8])
+
+	// Decode sub-TLVs if present
+	if len(value) > fixedPartLen {
+		subTLVBytes := value[fixedPartLen:]
+		subReader := bytes.NewReader(subTLVBytes)
+		// Pass profile to DecodeAll for sub-TLVs
+		decodedSubTLVs, err := DecodeAll(subReader, profile)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("failed to decode sub-TLVs for KeepAliveInterval: %w", err)
+		}
+		if subReader.Len() > 0 {
+			return fmt.Errorf("trailing data (%d bytes) after decoding sub-TLVs for KeepAliveInterval", subReader.Len())
+		}
+		t.SubTLVs = decodedSubTLVs
+	} else {
+		t.SubTLVs = nil
+	}
+	return nil
+}
+
+// GetSubTLVs returns the decoded sub-TLVs.
+func (t *KeepAliveIntervalTLV) GetSubTLVs() []TLVMarshaler {
+	return t.SubTLVs
+}
+
+// SetSubTLVs sets the sub-TLVs.
+func (t *KeepAliveIntervalTLV) SetSubTLVs(subTLVs []TLVMarshaler) error {
+	t.SubTLVs = subTLVs
+	return nil
+}
+
+// Helper to get interval as time.Duration
+func (t *KeepAliveIntervalTLV) Interval() time.Duration {
+	return time.Duration(t.IntervalMs) * time.Millisecond
 }

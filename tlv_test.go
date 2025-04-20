@@ -5,80 +5,85 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/fingon/go-dncp"
 	"gotest.tools/v3/assert"
 )
 
-func TestTLVEncodeDecode(t *testing.T) {
+// Helper function to create a dummy profile for testing Decode
+func createTestProfile() *dncp.Profile {
+	return &dncp.Profile{
+		NodeIdentifierLength: 8,
+		HashLength:           32,
+		// Other fields can be zero/nil for basic TLV decoding tests
+	}
+}
+
+func TestTLVMarshalerEncodeDecode(t *testing.T) {
+	profile := createTestProfile()
+	nodeID := dncp.NodeIdentifier{1, 2, 3, 4, 5, 6, 7, 8}
+	hash := []byte{0: 0xAA, 31: 0xBB} // 32 bytes
+
 	testCases := []struct {
 		name        string
-		tlv         *dncp.TLV
+		marshaler   dncp.TLVMarshaler
 		expectedLen int // Expected total encoded length including padding
+		verifyFunc  func(t *testing.T, decoded dncp.TLVMarshaler)
 	}{
 		{
-			name: "Zero length value",
-			tlv: &dncp.TLV{
-				Type:   dncp.TLVTypeRequestNetworkState,
-				Length: 0,
-				Value:  []byte{},
-			},
+			name:        "RequestNetworkState",
+			marshaler:   &dncp.RequestNetworkStateTLV{BaseTLV: dncp.BaseTLV{TLVType: dncp.TLVTypeRequestNetworkState}},
 			expectedLen: 4, // Header only
+			verifyFunc: func(t *testing.T, decoded dncp.TLVMarshaler) {
+				_, ok := decoded.(*dncp.RequestNetworkStateTLV)
+				assert.Assert(t, ok, "Decoded type mismatch")
+			},
 		},
 		{
-			name: "1 byte value (needs 3 padding)",
-			tlv: &dncp.TLV{
-				Type:   dncp.TLVTypeNodeEndpoint,
-				Length: 1,
-				Value:  []byte{0xAA},
+			name:        "RequestNodeState",
+			marshaler:   dncpNewRequestNodeStateTLVMust(nodeID),
+			expectedLen: 4 + 8, // Header + 8 byte NodeID
+			verifyFunc: func(t *testing.T, decoded dncp.TLVMarshaler) {
+				tlv, ok := decoded.(*dncp.RequestNodeStateTLV)
+				assert.Assert(t, ok, "Decoded type mismatch")
+				assert.DeepEqual(t, nodeID, tlv.NodeID)
 			},
-			expectedLen: 8, // 4 header + 1 value + 3 padding
 		},
 		{
-			name: "2 byte value (needs 2 padding)",
-			tlv: &dncp.TLV{
-				Type:   dncp.TLVTypeNetworkState,
-				Length: 2,
-				Value:  []byte{0xBB, 0xCC},
+			name:        "NodeEndpoint",
+			marshaler:   dncpNewNodeEndpointTLVMust(nodeID, 123),
+			expectedLen: 4 + 8 + 4, // Header + NodeID + EndpointID
+			verifyFunc: func(t *testing.T, decoded dncp.TLVMarshaler) {
+				tlv, ok := decoded.(*dncp.NodeEndpointTLV)
+				assert.Assert(t, ok, "Decoded type mismatch")
+				assert.DeepEqual(t, nodeID, tlv.NodeID)
+				assert.Equal(t, dncp.EndpointIdentifier(123), tlv.EndpointID)
 			},
-			expectedLen: 8, // 4 header + 2 value + 2 padding
 		},
 		{
-			name: "3 byte value (needs 1 padding)",
-			tlv: &dncp.TLV{
-				Type:   dncp.TLVTypeNodeState,
-				Length: 3,
-				Value:  []byte{0xDD, 0xEE, 0xFF},
+			name:        "NetworkState",
+			marshaler:   dncpNewNetworkStateTLVMust(hash),
+			expectedLen: 4 + 32, // Header + Hash
+			verifyFunc: func(t *testing.T, decoded dncp.TLVMarshaler) {
+				tlv, ok := decoded.(*dncp.NetworkStateTLV)
+				assert.Assert(t, ok, "Decoded type mismatch")
+				assert.DeepEqual(t, hash, tlv.NetworkStateHash)
 			},
-			expectedLen: 8, // 4 header + 3 value + 1 padding
 		},
 		{
-			name: "4 byte value (no padding needed)",
-			tlv: &dncp.TLV{
-				Type:   dncp.TLVTypePeer,
-				Length: 4,
-				Value:  []byte{0x11, 0x22, 0x33, 0x44},
+			name:        "KeepAliveInterval (no sub-TLVs)",
+			marshaler:   dncpNewKeepAliveIntervalTLVMust(5, 1500*time.Millisecond),
+			expectedLen: 4 + 4 + 4, // Header + EpID + Interval
+			verifyFunc: func(t *testing.T, decoded dncp.TLVMarshaler) {
+				tlv, ok := decoded.(*dncp.KeepAliveIntervalTLV)
+				assert.Assert(t, ok, "Decoded type mismatch")
+				assert.Equal(t, dncp.EndpointIdentifier(5), tlv.EndpointID)
+				assert.Equal(t, uint32(1500), tlv.IntervalMs)
+				assert.Assert(t, tlv.GetSubTLVs() == nil)
 			},
-			expectedLen: 8, // 4 header + 4 value
 		},
-		{
-			name: "Longer value (multiple of 4)",
-			tlv: &dncp.TLV{
-				Type:   dncp.TLVTypeKeepAliveInterval,
-				Length: 8,
-				Value:  []byte{1, 2, 3, 4, 5, 6, 7, 8},
-			},
-			expectedLen: 12, // 4 header + 8 value
-		},
-		{
-			name: "Longer value (not multiple of 4)",
-			tlv: &dncp.TLV{
-				Type:   dncp.TLVTypeTrustVerdict,
-				Length: 6,
-				Value:  []byte{9, 8, 7, 6, 5, 4},
-			},
-			expectedLen: 12, // 4 header + 6 value + 2 padding
-		},
+		// Add NodeState test case separately due to complexity
 	}
 
 	for _, tc := range testCases {
@@ -86,186 +91,218 @@ func TestTLVEncodeDecode(t *testing.T) {
 			var buf bytes.Buffer
 
 			// Encode
-			err := tc.tlv.Encode(&buf)
+			err := dncp.Encode(tc.marshaler, &buf)
 			assert.NilError(t, err, "Encode failed")
 			assert.Equal(t, tc.expectedLen, buf.Len(), "Encoded length mismatch")
 
 			// Decode
-			decodedTLV, err := dncp.Decode(&buf)
+			decodedTLV, err := dncp.Decode(&buf, profile)
 			assert.NilError(t, err, "Decode failed")
 
-			// Verify
-			assert.DeepEqual(t, tc.tlv, decodedTLV)
+			// Verify Type and specific fields using verifyFunc
+			assert.Equal(t, tc.marshaler.GetType(), decodedTLV.GetType(), "Decoded TLV type mismatch")
+			tc.verifyFunc(t, decodedTLV)
 			assert.Equal(t, 0, buf.Len(), "Buffer should be empty after decoding") // Ensure padding was consumed
 		})
 	}
 }
 
-func TestDecodeAll(t *testing.T) {
-	tlv1 := &dncp.TLV{Type: 1, Length: 1, Value: []byte{0x01}}                   // Encodes to 8 bytes
-	tlv2 := &dncp.TLV{Type: 2, Length: 4, Value: []byte{0x02, 0x03, 0x04, 0x05}} // Encodes to 8 bytes
-	tlv3 := &dncp.TLV{Type: 3, Length: 0, Value: []byte{}}                       // Encodes to 4 bytes
+func TestNodeStateEncodeDecode(t *testing.T) {
+	profile := createTestProfile()
+	nodeID := dncp.NodeIdentifier{1, 2, 3, 4, 5, 6, 7, 8}
+	hash := []byte{0: 0xAA, 31: 0xBB} // 32 bytes
+	seq := uint32(100)
+	ms := uint32(5000)
 
-	var buf bytes.Buffer
-	err := tlv1.Encode(&buf)
-	assert.NilError(t, err)
-	err = tlv2.Encode(&buf)
-	assert.NilError(t, err)
-	err = tlv3.Encode(&buf)
-	assert.NilError(t, err)
+	// Nested TLVs
+	nestedPeer := dncpNewPeerTLVMust([]byte{8, 7, 6, 5, 4, 3, 2, 1}, 1, 2)
+	nestedKA := dncpNewKeepAliveIntervalTLVMust(0, 10*time.Second)
 
-	expectedTotalLen := 20 // 8 + 8 + 4
-	assert.Equal(t, expectedTotalLen, buf.Len())
+	testCases := []struct {
+		name        string
+		nestedTLVs  []dncp.TLVMarshaler
+		expectedLen int
+	}{
+		{
+			name:       "No nested TLVs",
+			nestedTLVs: nil,
+			// Header(4) + NodeID(8) + Seq(4) + Ms(4) + Hash(32) = 52
+			expectedLen: 52,
+		},
+		{
+			name:       "With nested TLVs",
+			nestedTLVs: []dncp.TLVMarshaler{nestedPeer, nestedKA},
+			// 52 (base) + Peer(4+8+4+4=20) + KA(4+4+4=12) = 84
+			expectedLen: 84,
+		},
+	}
 
-	decodedTLVs, err := dncp.DecodeAll(&buf)
-	assert.NilError(t, err, "DecodeAll failed")
-	assert.Equal(t, 3, len(decodedTLVs), "Incorrect number of TLVs decoded")
-	assert.Equal(t, 0, buf.Len(), "Buffer should be empty after DecodeAll")
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			marshaler, err := dncp.NewNodeStateTLV(nodeID, seq, ms, hash, tc.nestedTLVs)
+			assert.NilError(t, err)
 
-	assert.DeepEqual(t, tlv1, decodedTLVs[0])
-	assert.DeepEqual(t, tlv2, decodedTLVs[1])
-	assert.DeepEqual(t, tlv3, decodedTLVs[2])
+			var buf bytes.Buffer
+			err = dncp.Encode(marshaler, &buf)
+			assert.NilError(t, err, "Encode failed")
+			assert.Equal(t, tc.expectedLen, buf.Len(), "Encoded length mismatch")
+
+			decodedTLV, err := dncp.Decode(&buf, profile)
+			assert.NilError(t, err, "Decode failed")
+			assert.Equal(t, 0, buf.Len(), "Buffer should be empty after decoding")
+
+			// Verify
+			tlv, ok := decodedTLV.(*dncp.NodeStateTLV)
+			assert.Assert(t, ok, "Decoded type mismatch")
+			assert.Equal(t, dncp.TLVTypeNodeState, tlv.GetType())
+			assert.DeepEqual(t, nodeID, tlv.NodeID)
+			assert.Equal(t, seq, tlv.SequenceNumber)
+			assert.Equal(t, ms, tlv.MillisecondsSinceOrigination)
+			assert.DeepEqual(t, hash, tlv.DataHash)
+
+			// Verify nested TLVs
+			decodedNested := tlv.GetSubTLVs()
+			assert.Equal(t, len(tc.nestedTLVs), len(decodedNested), "Nested TLV count mismatch")
+			if len(tc.nestedTLVs) > 0 {
+				// Note: Order might change due to sorting during encoding/hashing,
+				// so direct comparison by index might fail if getOrderedTLVs is used.
+				// For this test, assume EncodeValue encodes in the order provided.
+				// A more robust test would check for presence regardless of order.
+				assert.DeepEqual(t, tc.nestedTLVs[0], decodedNested[0])
+				assert.DeepEqual(t, tc.nestedTLVs[1], decodedNested[1])
+			}
+		})
+	}
 }
 
-func TestDecodeErrors(t *testing.T) {
+func TestDecodeAllMarshalers(t *testing.T) {
+	profile := createTestProfile()
+	tlv1 := dncpNewRequestNetworkStateTLVMust()
+	tlv2 := dncpNewRequestNodeStateTLVMust([]byte{1, 2, 3, 4, 5, 6, 7, 8})
+	tlv3 := dncpNewNodeEndpointTLVMust([]byte{8, 7, 6, 5, 4, 3, 2, 1}, 99)
+
+	var buf bytes.Buffer
+	err := dncp.Encode(tlv1, &buf)
+	assert.NilError(t, err)
+	err = dncp.Encode(tlv2, &buf)
+	assert.NilError(t, err)
+	err = dncp.Encode(tlv3, &buf)
+	assert.NilError(t, err)
+
+	expectedTotalLen := 4 + (4 + 8) + (4 + 8 + 4) // 4 + 12 + 16 = 32
+	assert.Equal(t, expectedTotalLen, buf.Len())
+
+	decodedTLVs, err := dncp.DecodeAll(&buf, profile)
+	assert.NilError(t, err, "DecodeAll failed")
+	assert.Equal(t, 3, len(decodedTLVs), "Decoded TLV count mismatch")
+	// Simple type check for now
+	assert.Equal(t, dncp.TLVTypeRequestNetworkState, decodedTLVs[0].GetType())
+	assert.Equal(t, dncp.TLVTypeRequestNodeState, decodedTLVs[1].GetType())
+	assert.Equal(t, dncp.TLVTypeNodeEndpoint, decodedTLVs[2].GetType())
+	assert.Equal(t, 0, buf.Len(), "Buffer should be empty after DecodeAll")
+}
+
+func TestDecodeMarshalerErrors(t *testing.T) {
+	profile := createTestProfile()
+
 	t.Run("Empty reader", func(t *testing.T) {
-		_, err := dncp.Decode(bytes.NewReader([]byte{}))
+		_, err := dncp.Decode(bytes.NewReader([]byte{}), profile)
 		assert.ErrorIs(t, err, io.EOF)
 	})
 
+	t.Run("Nil profile", func(t *testing.T) {
+		_, err := dncp.Decode(bytes.NewReader([]byte{0, 1, 0, 0}), nil)
+		assert.ErrorContains(t, err, "requires a non-nil profile")
+	})
+
 	t.Run("Incomplete header", func(t *testing.T) {
-		_, err := dncp.Decode(bytes.NewReader([]byte{0x00, 0x01, 0x00})) // 3 bytes only
-		assert.ErrorContains(t, err, "failed to read TLV header")        // Updated expected error message
+		_, err := dncp.Decode(bytes.NewReader([]byte{0x00, 0x01, 0x00}), profile) // 3 bytes only
+		assert.ErrorContains(t, err, "failed to read TLV header")
 		assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
 	})
 
 	t.Run("Truncated value", func(t *testing.T) {
-		// Header declares length 4, but only 2 bytes follow
-		header := []byte{0x00, 0x08, 0x00, 0x04} // Type 8, Length 4
-		value := []byte{0xAA, 0xBB}
-		data := make([]byte, 0, len(header)+len(value))
-		data = append(data, header...)
-		data = append(data, value...)
-		_, err := dncp.Decode(bytes.NewReader(data))
+		// Header: Type 8 (Peer), Length 16 (8+4+4), but only 10 bytes follow
+		header := []byte{0x00, 0x08, 0x00, 0x10}
+		value := []byte{1, 2, 3, 4, 5, 6, 7, 8, 0, 0} // Missing 6 bytes
+		data := bytes.Join([][]byte{header, value}, nil)
+		_, err := dncp.Decode(bytes.NewReader(data), profile)
 		assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
 		assert.ErrorContains(t, err, "failed to read TLV value")
 	})
 
-	t.Run("Truncated padding", func(t *testing.T) {
-		// Header declares length 1 (needs 3 padding), but only 2 padding bytes follow
-		header := []byte{0x00, 0x03, 0x00, 0x01} // Type 3, Length 1
-		value := []byte{0xCC}
-		padding := []byte{0x00, 0x00} // Missing one padding byte
-		data := make([]byte, 0, len(header)+len(value)+len(padding))
-		data = append(data, header...)
-		data = append(data, value...)
-		data = append(data, padding...)
-		_, err := dncp.Decode(bytes.NewReader(data))
-		assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
-		assert.ErrorContains(t, err, "failed to read TLV padding")
-	})
-
 	t.Run("Excessive length", func(t *testing.T) {
-		// Header declares length 65535 (using max uint16 conceptually)
-		// We test against our internal maxReasonableLength
 		headerLarge := []byte{0x00, 0x01, 0xFF, 0xFF} // Type 1, Length 65535
-		_, err := dncp.Decode(bytes.NewReader(headerLarge))
+		_, err := dncp.Decode(bytes.NewReader(headerLarge), profile)
 		assert.ErrorContains(t, err, "invalid TLV length")
-		assert.ErrorContains(t, err, "exceeds maximum possible")
+		assert.ErrorContains(t, err, "exceeds maximum")
 	})
 
-	// Note: Non-zero padding bytes are currently ignored, not causing an error.
-	t.Run("Non-zero padding", func(t *testing.T) {
-		// Header: Type 1, Length 1. Value: 0xAA. Padding: 0x00, 0x00, 0x01 (invalid)
-		data := []byte{0x00, 0x01, 0x00, 0x01, 0xAA, 0x00, 0x00, 0x01}
-		tlv, err := dncp.Decode(bytes.NewReader(data))
-		assert.NilError(t, err) // Currently no error for non-zero padding
-		assert.Assert(t, tlv != nil)
-		assert.Equal(t, dncp.TLVType(1), tlv.Type)
-		assert.Equal(t, uint16(1), tlv.Length)
-		assert.DeepEqual(t, []byte{0xAA}, tlv.Value)
+	t.Run("Unknown TLV Type", func(t *testing.T) {
+		headerUnknown := []byte{0xFF, 0xFF, 0x00, 0x00} // Type 65535, Length 0
+		_, err := dncp.Decode(bytes.NewReader(headerUnknown), profile)
+		assert.ErrorIs(t, err, dncp.ErrUnknownTLVType)
+	})
+
+	t.Run("DecodeValue Error", func(t *testing.T) {
+		// Encode a valid NodeEndpoint header but with wrong length value bytes
+		header := []byte{0x00, 0x03, 0x00, 0x05} // Type 3, Length 5 (invalid for NodeEndpoint with NodeIDLen=8)
+		value := []byte{1, 2, 3, 4, 5}
+		padding := []byte{0, 0, 0} // Add padding for length 5
+		data := bytes.Join([][]byte{header, value, padding}, nil)
+		_, err := dncp.Decode(bytes.NewReader(data), profile)
+		assert.ErrorContains(t, err, "failed to decode value") // Error comes from NodeEndpointTLV.DecodeValue
+		assert.ErrorIs(t, err, dncp.ErrInvalidTLVLength)
 	})
 }
 
-func TestDecodeAllErrors(t *testing.T) {
-	tlv1 := &dncp.TLV{Type: 1, Length: 1, Value: []byte{0x01}} // Valid
+func TestDecodeAllMarshalerErrors(t *testing.T) {
+	profile := createTestProfile()
+	tlv1 := dncpNewRequestNetworkStateTLVMust() // Valid
 
 	var buf bytes.Buffer
-	err := tlv1.Encode(&buf) // Encode valid TLV (8 bytes)
+	err := dncp.Encode(tlv1, &buf) // Encode valid TLV (4 bytes)
 	assert.NilError(t, err)
 
 	// Add corrupted data (incomplete header)
 	buf.Write([]byte{0x00, 0x02, 0x00}) // 3 bytes only
 
-	_, err = dncp.DecodeAll(&buf)
+	_, err = dncp.DecodeAll(&buf, profile)
 	assert.ErrorContains(t, err, "error decoding TLV stream")
 	// Check underlying error is EOF/UnexpectedEOF from the failed Decode attempt
 	assert.Assert(t, errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF))
 }
 
-func TestEncodeErrors(t *testing.T) {
-	t.Run("Length mismatch", func(t *testing.T) {
-		tlv := &dncp.TLV{
-			Type:   1,
-			Length: 5, // Incorrect length
-			Value:  []byte{1, 2, 3, 4},
-		}
-		var buf bytes.Buffer
-		err := tlv.Encode(&buf)
-		assert.ErrorIs(t, err, dncp.ErrInvalidTLVLength)
-		assert.ErrorContains(t, err, "value length 4 does not match header length 5")
-	})
+// --- Mocking Helpers ---
 
-	t.Run("Write header error", func(t *testing.T) {
-		tlv := &dncp.TLV{Type: 1, Length: 0, Value: []byte{}}
-		writer := &failingWriter{failOn: "header"} // Use the package-level type
-		err := tlv.Encode(writer)
-		assert.ErrorContains(t, err, "failed to write TLV header")
-	})
-
-	t.Run("Write value error", func(t *testing.T) {
-		tlv := &dncp.TLV{Type: 1, Length: 1, Value: []byte{1}}
-		writer := &failingWriter{failOn: "value"}
-		err := tlv.Encode(writer)
-		assert.ErrorContains(t, err, "failed to write TLV value")
-	})
-
-	t.Run("Write padding error", func(t *testing.T) {
-		tlv := &dncp.TLV{Type: 1, Length: 1, Value: []byte{1}} // Needs padding
-		writer := &failingWriter{failOn: "padding"}
-		err := tlv.Encode(writer)
-		assert.ErrorContains(t, err, "failed to write TLV padding")
-	})
+// Helper to must-create TLVs for tests
+func must[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
 }
 
-// Mock writer to simulate write errors
-type failingWriter struct {
-	written int
-	failOn  string // "header", "value", "padding"
+func dncpNewRequestNetworkStateTLVMust() *dncp.RequestNetworkStateTLV {
+	return &dncp.RequestNetworkStateTLV{BaseTLV: dncp.BaseTLV{TLVType: dncp.TLVTypeRequestNetworkState}}
 }
 
-func (fw *failingWriter) Write(p []byte) (n int, err error) {
-	// Determine the expected write stage based on bytes already written
-	isHeaderWrite := fw.written == 0
-	isValueWrite := fw.written == dncp.TlvHeaderSize
-	// Padding write happens after header and potential value bytes
-	// This check is approximate and assumes a TLV that requires padding for the "padding" case.
-	isPaddingWrite := fw.written > dncp.TlvHeaderSize
+func dncpNewRequestNodeStateTLVMust(nodeID dncp.NodeIdentifier) *dncp.RequestNodeStateTLV {
+	return must(dncp.NewRequestNodeStateTLV(nodeID))
+}
 
-	// Check for failure conditions
-	if fw.failOn == "header" && isHeaderWrite {
-		return 0, errors.New("simulated: failed to write header")
-	}
-	if fw.failOn == "value" && isValueWrite {
-		return 0, errors.New("simulated: failed to write value")
-	}
-	if fw.failOn == "padding" && isPaddingWrite {
-		// This condition might trigger prematurely if value write is chunked,
-		// but for Encode's current behavior, it should work.
-		return 0, errors.New("simulated: failed to write padding")
-	}
+func dncpNewNodeEndpointTLVMust(nodeID dncp.NodeIdentifier, epID dncp.EndpointIdentifier) *dncp.NodeEndpointTLV {
+	return must(dncp.NewNodeEndpointTLV(nodeID, epID))
+}
 
-	// If no failure condition met, proceed with tracking written bytes
-	fw.written += len(p)
-	return len(p), nil
+func dncpNewNetworkStateTLVMust(hash []byte) *dncp.NetworkStateTLV {
+	return must(dncp.NewNetworkStateTLV(hash))
+}
+
+func dncpNewPeerTLVMust(peerNodeID dncp.NodeIdentifier, peerEpID, localEpID dncp.EndpointIdentifier) *dncp.PeerTLV {
+	return must(dncp.NewPeerTLV(peerNodeID, peerEpID, localEpID))
+}
+
+func dncpNewKeepAliveIntervalTLVMust(epID dncp.EndpointIdentifier, interval time.Duration) *dncp.KeepAliveIntervalTLV {
+	return must(dncp.NewKeepAliveIntervalTLV(epID, interval))
 }

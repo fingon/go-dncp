@@ -67,7 +67,9 @@ func (d *DNCP) RemoveEndpoint(id EndpointIdentifier) error {
 	d.logger.Info("Removed endpoint", "id", id)
 
 	// Update local Peer TLVs and republish if necessary
-	if d.removeLocalPeerTLVsForEndpoint(id) {
+	needsRepublish := d.removeLocalPeerTLVsForEndpoint(id)
+
+	if needsRepublish {
 		d.mu.Unlock() // Unlock before calling PublishData which locks
 		// Need to reconstruct the current local data without the removed peers
 		currentData := d.getLocalDataForPublishing()

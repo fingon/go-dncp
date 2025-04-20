@@ -9,27 +9,33 @@ import (
 )
 
 // calculateNodeDataHash calculates and updates the hash for a single node's data.
-// Assumes node.Data is populated. Updates node.DataHash.
+// Assumes node.Data (map[TLVType][]TLVMarshaler) is populated. Updates node.DataHash.
 // MUST be called with d.mu held or on a non-shared NodeState before adding it.
 func (d *DNCP) calculateNodeDataHash(node *NodeState) error {
 	hasher := d.profile.HashFunction()
-	orderedTLVs := getOrderedTLVs(node.Data)
+	// Get ordered TLVMarshalers, encode them, and hash the resulting bytes.
+	// getOrderedTLVs now returns []TLVMarshaler, sorted based on their encoded binary form.
+	orderedTLVs, err := getOrderedTLVs(node.Data)
+	if err != nil {
+		d.logger.Error("Failed to get ordered TLVs for hashing", "nodeID", fmt.Sprintf("%x", node.NodeID), "err", err)
+		return fmt.Errorf("getting ordered TLVs for node %x failed: %w", node.NodeID, err)
+	}
 
 	var buf bytes.Buffer
 	for _, tlv := range orderedTLVs {
-		// Encode TLV to buffer (including padding)
+		// Encode TLVMarshaler to buffer (including padding)
 		buf.Reset()
-		err := tlv.Encode(&buf)
+		err := Encode(tlv, &buf) // Use generic Encode
 		if err != nil {
 			// Should not happen if TLV data is valid
-			d.logger.Error("Failed to encode TLV for hashing", "nodeID", fmt.Sprintf("%x", node.NodeID), "tlvType", tlv.Type, "err", err)
-			return fmt.Errorf("encoding TLV type %d for node %x failed: %w", tlv.Type, node.NodeID, err)
+			d.logger.Error("Failed to encode TLV for hashing", "nodeID", fmt.Sprintf("%x", node.NodeID), "tlvType", tlv.GetType(), "err", err)
+			return fmt.Errorf("encoding TLV type %d for node %x failed: %w", tlv.GetType(), node.NodeID, err)
 		}
 		// Write encoded TLV (including padding) to hasher
 		if _, err := hasher.Write(buf.Bytes()); err != nil {
 			// Should not happen with standard hashers
-			d.logger.Error("Failed to write TLV to hasher", "nodeID", fmt.Sprintf("%x", node.NodeID), "tlvType", tlv.Type, "err", err)
-			return fmt.Errorf("writing TLV type %d for node %x to hasher failed: %w", tlv.Type, node.NodeID, err)
+			d.logger.Error("Failed to write TLV to hasher", "nodeID", fmt.Sprintf("%x", node.NodeID), "tlvType", tlv.GetType(), "err", err)
+			return fmt.Errorf("writing TLV type %d for node %x to hasher failed: %w", tlv.GetType(), node.NodeID, err)
 		}
 	}
 

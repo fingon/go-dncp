@@ -6,66 +6,53 @@ import (
 	"slices"
 )
 
-// getOrderedTLVs converts NodeData map (map[TLVType][]*TLV) to a single slice
-// sorted according to RFC 7787 Section 7.2.3: "strictly ordered based on
-// ascending binary content (including TLV type and length)".
-func getOrderedTLVs(data NodeData) []*TLV {
-	if data == nil {
-		return nil
-	}
-	// Flatten the map into a single slice
-	totalTLVs := 0
-	for _, tlvSlice := range data {
-		totalTLVs += len(tlvSlice)
-	}
-	flatTLVs := make([]*TLV, 0, totalTLVs)
-	for _, tlvSlice := range data {
-		flatTLVs = append(flatTLVs, tlvSlice...)
-	}
-
-	// Sort the flat slice based on binary content
-	slices.SortFunc(flatTLVs, func(a, b *TLV) int {
-		// Primary sort key: Type
-		if a.Type != b.Type {
-			return int(a.Type) - int(b.Type)
-		}
-		// Secondary sort key: Length
-		if a.Length != b.Length {
-			return int(a.Length) - int(b.Length)
-		}
-		// Tertiary sort key: Value bytes
-		return bytes.Compare(a.Value, b.Value)
-	})
-	return flatTLVs
+// encodedTLV holds a marshaler and its encoded binary representation for sorting.
+type encodedTLV struct {
+	marshaler TLVMarshaler
+	encoded   []byte
 }
 
-// decodeNodeDataTLVs decodes the raw bytes from a NodeState TLV's NodeData field
-// into a NodeData map (map[TLVType][]*TLV).
-func decodeNodeDataTLVs(dataBytes []byte) (NodeData, error) {
-	if len(dataBytes) == 0 {
-		return make(NodeData), nil
-	}
-	reader := bytes.NewReader(dataBytes)
-	decodedTLVs, err := DecodeAll(reader)
-	if err != nil {
-		// If DecodeAll fails partially, we might still have some TLVs in decodedTLVs.
-		// However, the RFC implies the entire NodeData should be verifiable by hash.
-		// If decoding fails, we likely can't verify the hash, so discard everything.
-		return nil, fmt.Errorf("failed to decode nested TLVs: %w", err)
+// getOrderedTLVs converts NodeData map (map[TLVType][]TLVMarshaler) to a single slice
+// sorted according to RFC 7787 Section 7.2.3: "strictly ordered based on
+// ascending binary content". This requires encoding each TLV first.
+// Returns an error if any TLV fails to encode.
+func getOrderedTLVs(data NodeData) ([]TLVMarshaler, error) {
+	if data == nil {
+		return nil, nil
 	}
 
-	// Check if DecodeAll consumed all bytes (it should if err is nil)
-	if reader.Len() > 0 {
-		// This indicates an issue with DecodeAll or the input data structure
-		return nil, fmt.Errorf("internal error: trailing data (%d bytes) after decoding nested TLVs without error", reader.Len())
+	// Flatten the map into a single slice and encode each TLV
+	totalTLVs := 0
+	for _, marshalerSlice := range data {
+		totalTLVs += len(marshalerSlice)
+	}
+	flatEncodedTLVs := make([]encodedTLV, 0, totalTLVs)
+	var buf bytes.Buffer
+	for _, marshalerSlice := range data {
+		for _, marshaler := range marshalerSlice {
+			buf.Reset()
+			err := Encode(marshaler, &buf) // Use generic Encode
+			if err != nil {
+				return nil, fmt.Errorf("failed to encode TLV type %d for sorting: %w", marshaler.GetType(), err)
+			}
+			flatEncodedTLVs = append(flatEncodedTLVs, encodedTLV{
+				marshaler: marshaler,
+				encoded:   slices.Clone(buf.Bytes()), // Store encoded bytes
+			})
+		}
 	}
 
-	// Group TLVs by type into the map
-	nodeDataMap := make(NodeData)
-	for _, tlv := range decodedTLVs {
-		nodeDataMap[tlv.Type] = append(nodeDataMap[tlv.Type], tlv)
+	// Sort the flat slice based on encoded binary content
+	slices.SortFunc(flatEncodedTLVs, func(a, b encodedTLV) int {
+		return bytes.Compare(a.encoded, b.encoded)
+	})
+
+	// Extract the sorted marshalers
+	sortedMarshalers := make([]TLVMarshaler, totalTLVs)
+	for i, et := range flatEncodedTLVs {
+		sortedMarshalers[i] = et.marshaler
 	}
-	return nodeDataMap, nil
+	return sortedMarshalers, nil
 }
 
 // CompareSequenceNumbers compares two sequence numbers, handling wrap-around.

@@ -54,10 +54,14 @@ func (d *DNCP) AddOrUpdatePeer(localEpID EndpointIdentifier, peerNodeID NodeIden
 		d.logger.Debug("Updated existing peer contact", "localEpID", localEpID, "peerNodeID", fmt.Sprintf("%x", peerNodeID))
 	}
 
-	// Check if dense mode needs evaluation after adding/updating peer
+	// Update local Peer TLV for this new/updated peer relationship
 	needsRepublish := d.addLocalPeerTLV(localEpID, peerNodeID, peerEpID)
-	if d.profile.UseDenseOptimization && ep.TransportMode == TransportModeMulticastUnicast && d.profile.DensePeerThreshold > 0 && uint(len(ep.peers)) > d.profile.DensePeerThreshold {
+
+	// Check if dense mode needs evaluation after adding/updating peer
+	// This check should happen *after* the peer is added to ep.peers
+	if d.profile.UseDenseOptimization && ep.TransportMode == TransportModeMulticastUnicast {
 		// Check density and potentially switch modes (locks/unlocks internally)
+		// checkAndHandleDenseLink will compare len(ep.peers) against threshold
 		if d.checkAndHandleDenseLink(ep) {
 			needsRepublish = true // Mode switch requires republish
 		}

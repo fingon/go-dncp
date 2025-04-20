@@ -27,13 +27,13 @@ func (d *DNCP) createEndpointTransmitFunc(ep *Endpoint) trickle.TransmitFunc {
 	return func() {
 		d.mu.RLock()
 		// Include NodeEndpoint TLV before NetworkState TLV (Sec 4.2)
-		nodeEpTLV, err := NewNodeEndpointTLV(d.nodeID, ep.ID, d.profile.NodeIdentifierLength)
+		nodeEpMarshaler, err := NewNodeEndpointTLV(d.nodeID, ep.ID) // No length needed
 		if err != nil {
 			d.logger.Error("Failed to create NodeEndpoint TLV for Trickle transmit", "epID", ep.ID, "err", err)
 			d.mu.RUnlock()
 			return
 		}
-		netStateTLV, err := NewNetworkStateTLV(d.networkStateHash, d.profile.HashLength)
+		netStateMarshaler, err := NewNetworkStateTLV(d.networkStateHash) // No length needed
 		if err != nil {
 			d.logger.Error("Failed to create NetworkState TLV for Trickle transmit", "epID", ep.ID, "err", err)
 			d.mu.RUnlock()
@@ -48,7 +48,8 @@ func (d *DNCP) createEndpointTransmitFunc(ep *Endpoint) trickle.TransmitFunc {
 			return
 		}
 
-		err = d.sendTLVs(dest, []*TLV{nodeEpTLV, netStateTLV})
+		// Send the marshalers
+		err = d.sendTLVs(dest, []TLVMarshaler{nodeEpMarshaler, netStateMarshaler})
 		if err != nil {
 			d.logger.Error("Failed Trickle transmission for endpoint", "epID", ep.ID, "dest", dest, "err", err)
 		} else {
@@ -62,13 +63,13 @@ func (d *DNCP) createPeerTransmitFunc(peer *Peer) trickle.TransmitFunc {
 	return func() {
 		d.mu.RLock()
 		// Include NodeEndpoint TLV before NetworkState TLV (Sec 4.2)
-		nodeEpTLV, err := NewNodeEndpointTLV(d.nodeID, peer.LocalEndpointID, d.profile.NodeIdentifierLength)
+		nodeEpMarshaler, err := NewNodeEndpointTLV(d.nodeID, peer.LocalEndpointID) // No length needed
 		if err != nil {
 			d.logger.Error("Failed to create NodeEndpoint TLV for peer Trickle transmit", "peerNodeID", fmt.Sprintf("%x", peer.NodeID), "err", err)
 			d.mu.RUnlock()
 			return
 		}
-		netStateTLV, err := NewNetworkStateTLV(d.networkStateHash, d.profile.HashLength)
+		netStateMarshaler, err := NewNetworkStateTLV(d.networkStateHash) // No length needed
 		if err != nil {
 			d.logger.Error("Failed to create NetworkState TLV for peer Trickle transmit", "peerNodeID", fmt.Sprintf("%x", peer.NodeID), "err", err)
 			d.mu.RUnlock()
@@ -82,7 +83,8 @@ func (d *DNCP) createPeerTransmitFunc(peer *Peer) trickle.TransmitFunc {
 			return
 		}
 
-		err = d.sendTLVs(dest, []*TLV{nodeEpTLV, netStateTLV})
+		// Send the marshalers
+		err = d.sendTLVs(dest, []TLVMarshaler{nodeEpMarshaler, netStateMarshaler})
 		if err != nil {
 			d.logger.Error("Failed Trickle transmission for peer", "peerNodeID", fmt.Sprintf("%x", peer.NodeID), "dest", dest, "err", err)
 		} else {
@@ -101,10 +103,10 @@ func (d *DNCP) createConsistencyFunc() trickle.ConsistencyFunc[[]byte] {
 			return false // Inconsistent if nil
 		}
 
-		// Use DecodeAll as the order isn't guaranteed.
+		// Use DecodeAll with profile context.
 		var receivedHash []byte
 		reader := bytes.NewReader(data)
-		decodedTLVs, err := DecodeAll(reader)
+		decodedMarshalers, err := DecodeAll(reader, d.profile)
 		if err != nil {
 			// Log the error but still check if NetworkState was decoded before the error
 			d.logger.Warn("Error decoding TLV stream in consistency check", "err", err)
@@ -112,17 +114,12 @@ func (d *DNCP) createConsistencyFunc() trickle.ConsistencyFunc[[]byte] {
 
 		// Find the NetworkState TLV among the decoded ones
 		found := false
-		for _, tlv := range decodedTLVs {
-			if tlv.Type == TLVTypeNetworkState {
-				netState, err := DecodeNetworkStateTLV(tlv, d.profile.HashLength)
-				if err == nil {
-					receivedHash = netState.NetworkStateHash
-					found = true
-					break // Found the first NetworkState TLV
-				}
-				d.logger.Warn("Failed to decode NetworkState TLV in consistency check", "err", err)
-				// Continue searching in case there's another valid one? No, spec implies one.
-				break
+		for _, marshaler := range decodedMarshalers {
+			if netStateTLV, ok := marshaler.(*NetworkStateTLV); ok {
+				// Successfully decoded and type asserted
+				receivedHash = netStateTLV.NetworkStateHash
+				found = true
+				break // Found the NetworkState TLV
 			}
 		}
 

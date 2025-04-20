@@ -38,16 +38,16 @@ func (d *DNCP) updateTopologyGraph() bool {
 		if node.Data == nil {
 			continue
 		}
-		// Iterate through all Peer TLVs published by the node
-		peerTLVs, ok := node.Data[TLVTypePeer]
+		// Iterate through all Peer TLV marshalers published by the node
+		peerMarshalers, ok := node.Data[TLVTypePeer]
 		if !ok {
 			continue
 		}
-		for _, tlv := range peerTLVs {
-			// No need to check type again, we fetched the slice for TLVTypePeer
-			peerTLV, err := DecodePeerTLV(tlv, d.profile.NodeIdentifierLength)
-			if err != nil {
-				d.logger.Warn("Failed to decode Peer TLV during topology update", "nodeID", fmt.Sprintf("%x", node.NodeID), "err", err)
+		for _, marshaler := range peerMarshalers {
+			// Type assert to get the PeerTLV struct
+			peerTLV, ok := marshaler.(*PeerTLV)
+			if !ok {
+				d.logger.Warn("Failed to type assert Peer TLV during topology update", "nodeID", fmt.Sprintf("%x", node.NodeID))
 				continue
 			}
 			if _, ok := node.publishedPeers[peerTLV.LocalEndpointID]; !ok {

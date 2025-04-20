@@ -220,10 +220,9 @@ func (ep *Endpoint) SendRequestToNode(targetNodeID dncp.NodeIdentifier, method, 
 
 	var lastErr error
 	for _, tlv := range urlTLVs {
-		decodedURL, err := DecodeURLTLV(tlv)
-		if err != nil {
-			ep.logger.Warn("Failed to decode URL TLV from peer", "targetNodeID", fmt.Sprintf("%x", targetNodeID), "err", err)
-			lastErr = err
+		decodedURL, ok := tlv.(*URLTLV)
+		if !ok {
+			ep.logger.Warn("Wrong type in URLTLV")
 			continue
 		}
 
@@ -288,22 +287,22 @@ func (ep *Endpoint) GetLocalURLs() []string {
 	return slices.Clone(ep.localURLs)
 }
 
-// GetLocalURLTLVs returns the URL TLVs for this endpoint's URLs.
-// This is used by the DNCP instance to include URL TLVs in multicast messages.
-func (ep *Endpoint) GetLocalURLTLVs() []*dncp.TLV {
+// GetLocalURLTLVs returns the URL TLV marshalers for this endpoint's URLs.
+// This might be used by external logic if needed.
+func (ep *Endpoint) GetLocalURLTLVs() []dncp.TLVMarshaler {
 	ep.mu.RLock()
 	defer ep.mu.RUnlock()
 
-	tlvs := make([]*dncp.TLV, 0, len(ep.localURLs))
+	marshalers := make([]dncp.TLVMarshaler, 0, len(ep.localURLs))
 	for _, urlStr := range ep.localURLs {
-		tlv, err := NewURLTLV(urlStr)
+		marshaler, err := NewURLTLV(urlStr)
 		if err != nil {
-			ep.logger.Error("Failed to create URL TLV", "url", urlStr, "err", err)
+			ep.logger.Error("Failed to create URL TLV marshaler", "url", urlStr, "err", err)
 			continue
 		}
-		tlvs = append(tlvs, tlv)
+		marshalers = append(marshalers, marshaler)
 	}
-	return tlvs
+	return marshalers
 }
 
 // SendMulticastAnnouncement sends a multicast announcement with this node's URLs.

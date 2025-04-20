@@ -105,9 +105,8 @@ type Profile struct {
 }
 
 // NodeData represents the set of TLVs published by a node.
-// Stored as a map where each key maps to a slice of TLVs of that type.
-// This allows multiple TLVs of the same type (e.g., Peer TLV).
-type NodeData map[TLVType][]*TLV
+// Stored as a map where each key maps to a slice of TLVMarshaler instances of that type.
+type NodeData map[TLVType][]TLVMarshaler
 
 // NodeState holds the state associated with a specific node in the DNCP network.
 // RFC 7787 Section 2 & 5.
@@ -179,10 +178,9 @@ type DNCP struct {
 	AddPeerFunc func(localEndpointID EndpointIdentifier, peerNodeID NodeIdentifier, peerEndpointID EndpointIdentifier, peerAddress string) error
 	// RemovePeerFunc is called when a peer relationship should be terminated.
 	RemovePeerFunc func(localEndpointID EndpointIdentifier, peerNodeID NodeIdentifier) error
-	// HandleCollisionFunc is called when a node state update for the local node ID
-	// is received with a higher sequence number or same sequence number but different hash.
-	// The implementation should typically generate a new node ID and restart DNCP.
-	// If nil, the default behavior is to republish local state with a higher sequence number.
+	// HandleCollisionFunc is an optional callback invoked when a collision for the local node ID is detected.
+	// If the callback returns an error, DNCP might propagate it (e.g., to signal a required restart).
+	// If nil or returns nil, DNCP performs default behavior (republish).
 	HandleCollisionFunc func() error
 
 	// --- Internal State for Rate Limiting ---
@@ -192,6 +190,13 @@ type DNCP struct {
 // GetNodeID returns the node identifier of this DNCP instance.
 func (d *DNCP) GetNodeID() NodeIdentifier {
 	return slices.Clone(d.nodeID)
+}
+
+// GetProfile returns a pointer to the profile configuration used by this instance.
+// Note: Modifying the returned profile after initialization is not recommended.
+func (d *DNCP) GetProfile() *Profile {
+	// Profile is set at creation and assumed immutable afterwards.
+	return d.profile
 }
 
 // New creates a new DNCP instance.
@@ -244,14 +249,14 @@ func New(nodeID NodeIdentifier, profile Profile) (*DNCP, error) {
 
 	// --- Initialize DNCP Instance ---
 	d := &DNCP{
-		profile:             &profile, // Store a pointer to the validated profile
-		nodeID:              slices.Clone(nodeID),
-		logger:              profile.Logger.With("module", "dncp", "nodeID", fmt.Sprintf("%x", nodeID)), // Use fmt for hex
-		clock:               profile.Clock,
-		nodes:               make(map[string]*NodeState),
-		endpoints:           make(map[EndpointIdentifier]*Endpoint),
-		stopChan:            make(chan struct{}),
-		HandleCollisionFunc: profile.HandleCollisionFunc, // Assign from profile
+		profile:   &profile, // Store a pointer to the validated profile
+		nodeID:    slices.Clone(nodeID),
+		logger:    profile.Logger.With("module", "dncp", "nodeID", fmt.Sprintf("%x", nodeID)), // Use fmt for hex
+		clock:     profile.Clock,
+		nodes:     make(map[string]*NodeState),
+		endpoints: make(map[EndpointIdentifier]*Endpoint),
+		stopChan:  make(chan struct{}),
+		// HandleCollisionFunc is part of the profile struct now
 		lastNetStateRequest: make(map[string]map[string]time.Time),
 	}
 
@@ -303,10 +308,16 @@ func (d *DNCP) GetNodeData(nodeID NodeIdentifier) (NodeData, error) {
 		return nil, fmt.Errorf("node %x is not reachable", nodeID)
 	}
 
-	// Return a deep copy of the node data to prevent modification
+	// Return a deep copy of the node data map and the marshaler slices
 	dataCopy := make(NodeData, len(node.Data))
-	for typ, tlvSlice := range node.Data {
-		dataCopy[typ] = slices.Clone(tlvSlice)
+	for typ, marshalerSlice := range node.Data {
+		// Clone the slice itself
+		clonedSlice := make([]TLVMarshaler, len(marshalerSlice))
+		copy(clonedSlice, marshalerSlice)
+		// Note: This is a shallow copy of the marshalers within the slice.
+		// If marshalers were mutable and modified elsewhere, this could be an issue.
+		// Assuming marshalers are treated as immutable after creation/decoding.
+		dataCopy[typ] = clonedSlice
 	}
 
 	return dataCopy, nil
@@ -385,6 +396,7 @@ func (d *DNCP) PublishData(newData NodeData) error {
 
 // HandleReceivedTLVs processes a buffer of received TLV data from a specific source.
 // isMulticast indicates if the data arrived via a multicast transport.
+// Returns an error if processing fails critically or if a collision requires application intervention.
 func (d *DNCP) HandleReceivedTLVs(data []byte, sourceAddr string, receivedOnLocalEpID EndpointIdentifier, isMulticast bool) error {
 	d.logger.Debug("Handling received data", "source", sourceAddr, "localEpID", receivedOnLocalEpID, "len", len(data), "isMulticast", isMulticast)
 	reader := bytes.NewReader(data)
@@ -395,8 +407,9 @@ func (d *DNCP) HandleReceivedTLVs(data []byte, sourceAddr string, receivedOnLoca
 
 	// Attempt to decode NodeEndpoint TLV first if required by transport (Sec 4.2)
 	// Assuming datagram transport where it MUST be first if present.
-	var tlvsToProcess []*TLV
-	firstTLV, err := Decode(reader)
+	var tlvsToProcess []TLVMarshaler
+	// Pass profile to Decode
+	firstTLV, err := Decode(reader, d.profile)
 
 	needsDenseCheck := false
 
@@ -414,9 +427,15 @@ func (d *DNCP) HandleReceivedTLVs(data []byte, sourceAddr string, receivedOnLoca
 		d.logger.Warn("Failed to decode first potential TLV, attempting DecodeAll", "source", sourceAddr, "err", err)
 		_, _ = reader.Seek(0, io.SeekStart) // Reset reader
 		// Fall through to DecodeAll below
-	case firstTLV != nil && firstTLV.Type == TLVTypeNodeEndpoint:
+	case firstTLV != nil && firstTLV.GetType() == TLVTypeNodeEndpoint:
 		// Successfully decoded NodeEndpoint TLV first.
-		nodeEpTLV, err := DecodeNodeEndpointTLV(firstTLV, d.profile.NodeIdentifierLength)
+		// Type assert to access fields
+		nodeEpTLV, ok := firstTLV.(*NodeEndpointTLV)
+		if !ok {
+			// This should not happen if GetType() returned TLVTypeNodeEndpoint
+			d.logger.Error("Internal error: Failed type assertion for NodeEndpointTLV", "source", sourceAddr)
+			return errors.New("internal error: failed type assertion for NodeEndpointTLV")
+		}
 		if err != nil {
 			d.logger.Warn("Failed to decode NodeEndpoint TLV", "source", sourceAddr, "err", err)
 			return fmt.Errorf("broken NodeEndpointTLV: %w", err)
@@ -471,7 +490,8 @@ func (d *DNCP) HandleReceivedTLVs(data []byte, sourceAddr string, receivedOnLoca
 	}
 
 	// Decode all TLVs (either remaining or all if first failed/wasn't NodeEndpoint)
-	tlvsToProcess, err = DecodeAll(reader)
+	// Pass profile to DecodeAll
+	tlvsToProcess, err = DecodeAll(reader, d.profile)
 	if err != nil {
 		// Log error but process the TLVs that were decoded successfully before the error.
 		d.logger.Warn("Error decoding TLV stream", "source", sourceAddr, "err", err)
@@ -484,8 +504,13 @@ func (d *DNCP) HandleReceivedTLVs(data []byte, sourceAddr string, receivedOnLoca
 	}
 
 	// Process decoded TLVs
-	for _, tlv := range tlvsToProcess {
-		d.processSingleTLV(tlv, senderNodeID, senderEndpointID, sourceAddr, isMulticast)
+	for _, tlvMarshaler := range tlvsToProcess {
+		// processSingleTLV might return an error (e.g., collision)
+		if err := d.processSingleTLV(tlvMarshaler, senderNodeID, senderEndpointID, sourceAddr, isMulticast); err != nil {
+			// If a collision error occurs, stop processing further TLVs in this batch and return the error.
+			d.logger.Error("Error processing TLV, stopping batch processing", "type", tlvMarshaler.GetType(), "err", err)
+			return err // Propagate the error (e.g., CollisionRestartError)
+		}
 	}
 
 	// Perform dense check if triggered by highest node ID change
@@ -506,5 +531,5 @@ func (d *DNCP) HandleReceivedTLVs(data []byte, sourceAddr string, receivedOnLoca
 		d.mu.Unlock()
 	}
 
-	return nil // Return nil even if DecodeAll had errors, as some TLVs might have been processed
+	return nil // Return nil if all TLVs processed successfully without critical errors
 }

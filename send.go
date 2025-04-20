@@ -7,11 +7,11 @@ import (
 	"slices"
 )
 
-// sendTLV encodes and sends a single TLV to the destination.
-func (d *DNCP) sendTLV(destination string, tlv *TLV) error {
+// sendTLV encodes and sends a single TLVMarshaler to the destination.
+func (d *DNCP) sendTLV(destination string, tlv TLVMarshaler) error {
 	var buf bytes.Buffer
-	if err := tlv.Encode(&buf); err != nil {
-		return fmt.Errorf("failed to encode TLV type %d: %w", tlv.Type, err)
+	if err := Encode(tlv, &buf); err != nil { // Use the generic Encode function
+		return fmt.Errorf("failed to encode TLV type %d: %w", tlv.GetType(), err)
 	}
 	if d.SendFunc == nil {
 		return errors.New("SendFunc is not configured")
@@ -19,14 +19,14 @@ func (d *DNCP) sendTLV(destination string, tlv *TLV) error {
 	return d.SendFunc(destination, buf.Bytes())
 }
 
-// sendTLVs encodes and sends multiple TLVs together in one payload.
-func (d *DNCP) sendTLVs(destination string, tlvs []*TLV) error {
+// sendTLVs encodes and sends multiple TLVMarshalers together in one payload.
+func (d *DNCP) sendTLVs(destination string, tlvs []TLVMarshaler) error {
 	var buf bytes.Buffer
 	for _, tlv := range tlvs {
-		if err := tlv.Encode(&buf); err != nil {
+		if err := Encode(tlv, &buf); err != nil { // Use the generic Encode function
 			// Log error for the specific TLV but try to send the rest?
 			// Or fail the whole batch? Fail batch for now.
-			return fmt.Errorf("failed to encode TLV type %d in batch: %w", tlv.Type, err)
+			return fmt.Errorf("failed to encode TLV type %d in batch: %w", tlv.GetType(), err)
 		}
 	}
 	if buf.Len() == 0 {
@@ -38,18 +38,20 @@ func (d *DNCP) sendTLVs(destination string, tlvs []*TLV) error {
 	return d.SendFunc(destination, buf.Bytes())
 }
 
-// requestNetworkState sends a Request Network State TLV.
+// requestNetworkState sends a Request Network State TLV struct.
 func (d *DNCP) requestNetworkState(destination string) {
-	tlv := &TLV{Type: TLVTypeRequestNetworkState, Length: 0, Value: []byte{}}
-	err := d.sendTLV(destination, tlv)
+	// Create the specific TLV struct instance
+	tlv := &RequestNetworkStateTLV{BaseTLV: BaseTLV{TLVType: TLVTypeRequestNetworkState}}
+	err := d.sendTLV(destination, tlv) // Pass the TLVMarshaler
 	if err != nil {
 		d.logger.Error("Failed to send RequestNetworkState", "destination", destination, "err", err)
 	}
 }
 
-// requestNodeState sends a Request Node State TLV.
+// requestNodeState sends a Request Node State TLV struct.
 func (d *DNCP) requestNodeState(destination string, nodeID NodeIdentifier) {
-	tlv, err := NewRequestNodeStateTLV(nodeID, d.profile.NodeIdentifierLength)
+	// Create the specific TLV struct instance
+	tlv, err := NewRequestNodeStateTLV(nodeID) // No length needed here
 	if err != nil {
 		d.logger.Error("Failed to create RequestNodeState TLV", "nodeID", fmt.Sprintf("%x", nodeID), "err", err)
 		return
@@ -76,27 +78,21 @@ func (d *DNCP) sendNodeState(destination string, nodeID NodeIdentifier, includeD
 	seq := nodeState.SequenceNumber
 	hash := slices.Clone(nodeState.DataHash)
 	msSinceOrigination := uint32(d.clock.Now().Sub(nodeState.OriginationTime).Milliseconds())
-	var dataBytes []byte
-	var dataBuf bytes.Buffer
+	var nestedTLVs []TLVMarshaler
+	var err error
 	if includeData && nodeState.Data != nil {
-		// Get all TLVs ordered correctly for encoding
-		orderedTLVs := getOrderedTLVs(nodeState.Data)
-		for _, dataTLV := range orderedTLVs {
-			if err := dataTLV.Encode(&dataBuf); err != nil {
-				d.logger.Error("Failed to encode nested TLV for NodeState data", "nodeID", fmt.Sprintf("%x", nodeID), "type", dataTLV.Type, "err", err)
-				// Cannot send with data if any TLV fails encoding
-				dataBytes = nil // Ensure dataBytes is nil if encoding fails
-				break
-			}
-		}
-		// Only assign dataBytes if encoding succeeded for all TLVs
-		if dataBytes != nil {
-			dataBytes = dataBuf.Bytes()
-		}
+		// Get all TLVMarshalers ordered correctly for encoding
+		// Note: getOrderedTLVs now returns []TLVMarshaler
+		nestedTLVs, err = getOrderedTLVs(nodeState.Data)
 	}
 	d.mu.RUnlock() // Unlock after accessing nodeState data
+	if err != nil {
+		d.logger.Error("getOrderedTLVs failed", "err", err)
+		return
+	}
 
-	tlv, err := NewNodeStateTLV(nodeID, seq, msSinceOrigination, hash, dataBytes, d.profile.NodeIdentifierLength, d.profile.HashLength)
+	// Create the specific TLV struct instance
+	tlv, err := NewNodeStateTLV(nodeID, seq, msSinceOrigination, hash, nestedTLVs) // Pass marshalers directly
 	if err != nil {
 		d.logger.Error("Failed to create NodeState TLV", "nodeID", fmt.Sprintf("%x", nodeID), "err", err)
 		return
@@ -108,15 +104,15 @@ func (d *DNCP) sendNodeState(destination string, nodeID NodeIdentifier, includeD
 	}
 }
 
-// sendFullNetworkState sends the Network State TLV followed by all known Node State TLVs (headers only).
+// sendFullNetworkState sends the Network State TLV struct followed by all known Node State TLV structs (headers only).
 func (d *DNCP) sendFullNetworkState(destination string) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	tlvsToSend := make([]*TLV, 0, len(d.nodes)+1)
+	tlvsToSend := make([]TLVMarshaler, 0, len(d.nodes)+1)
 
 	// 1. Network State TLV
-	netStateTLV, err := NewNetworkStateTLV(d.networkStateHash, d.profile.HashLength)
+	netStateTLV, err := NewNetworkStateTLV(d.networkStateHash) // No length needed
 	if err != nil {
 		d.logger.Error("Failed to create NetworkState TLV for full state send", "err", err)
 		return // Cannot proceed without network state
@@ -131,14 +127,13 @@ func (d *DNCP) sendFullNetworkState(destination string) {
 		// if !nodeState.isReachable { continue }
 
 		msSinceOrigination := uint32(now.Sub(nodeState.OriginationTime).Milliseconds())
+		// Create NodeStateTLV struct with nil NestedTLVs
 		nodeTLV, err := NewNodeStateTLV(
 			nodeState.NodeID,
 			nodeState.SequenceNumber,
 			msSinceOrigination,
 			nodeState.DataHash,
-			nil, // No data
-			d.profile.NodeIdentifierLength,
-			d.profile.HashLength,
+			nil, // No nested TLVs
 		)
 		if err != nil {
 			d.logger.Error("Failed to create NodeState TLV header for full state send", "nodeID", fmt.Sprintf("%x", nodeState.NodeID), "err", err)

@@ -15,45 +15,45 @@ func (d *DNCP) checkPeerTimeouts() {
 		for peerKey, peer := range ep.peers { // Use peerKey for node lookup
 			// Determine the effective keep-alive interval for this peer relationship
 			keepAliveInterval := d.profile.KeepAliveInterval // Start with profile default
+			foundSpecific := false                           // Declare variables outside the if block
+			specificInterval := time.Duration(0)
+			defaultInterval := time.Duration(0)
 
-			// Look up the peer's NodeState to find their published KeepAliveInterval TLVs
+			// Look up the peer's NodeState to find their published KeepAliveInterval TLV marshalers
 			peerNodeState, nodeExists := d.nodes[peerKey]
 			if nodeExists && peerNodeState.Data != nil {
-				kaTLVs, tlvsExist := peerNodeState.Data[TLVTypeKeepAliveInterval]
-				if !tlvsExist {
-					continue
-				}
-				foundSpecific := false
-				specificInterval := time.Duration(0)
-				defaultInterval := time.Duration(0)
+				kaMarshalers, tlvsExist := peerNodeState.Data[TLVTypeKeepAliveInterval]
+				if tlvsExist { // Only proceed if the key exists
+					// Variables are now declared above, just assign here
+					for _, marshaler := range kaMarshalers {
+						kaTLV, ok := marshaler.(*KeepAliveIntervalTLV)
+						if !ok {
+							d.logger.Warn("Failed to type assert KeepAliveInterval TLV during timeout check", "peerNodeID", fmt.Sprintf("%x", peer.NodeID))
+							continue
+						}
 
-				for _, kaTLV := range kaTLVs {
-					decodedKA, err := DecodeKeepAliveIntervalTLV(kaTLV)
-					if err != nil {
-						d.logger.Warn("Failed to decode KeepAliveInterval TLV during timeout check", "peerNodeID", fmt.Sprintf("%x", peer.NodeID), "err", err)
-						continue
-					}
-
-					interval := time.Duration(decodedKA.Interval) * time.Millisecond
-					if decodedKA.EndpointID == peer.LocalEndpointID {
-						// Found interval specific to the endpoint this peer is on
-						specificInterval = interval
-						foundSpecific = true
-						break // Specific endpoint ID always wins
-					} else if decodedKA.EndpointID == ReservedEndpointIdentifier {
-						// Found a default interval for the peer
-						defaultInterval = interval
+						interval := kaTLV.Interval() // Use helper
+						if kaTLV.EndpointID == peer.LocalEndpointID {
+							// Found interval specific to the endpoint this peer is on
+							specificInterval = interval
+							foundSpecific = true
+							break // Specific endpoint ID always wins
+						} else if kaTLV.EndpointID == ReservedEndpointIdentifier {
+							// Found a default interval for the peer
+							defaultInterval = interval
+						}
 					}
 				}
+			} // End of if tlvsExist
 
-				// Determine the effective interval (specific wins over default)
-				if foundSpecific {
-					keepAliveInterval = specificInterval
-				} else if defaultInterval > 0 { // Use default only if non-zero and no specific found
-					keepAliveInterval = defaultInterval
-				}
-				// If neither specific nor default > 0 found, keepAliveInterval remains the profile default
+			// Determine the effective interval (specific wins over default)
+			// These variables are now accessible here
+			if foundSpecific {
+				keepAliveInterval = specificInterval
+			} else if defaultInterval > 0 { // Use default only if non-zero and no specific found
+				keepAliveInterval = defaultInterval
 			}
+			// If neither specific nor default > 0 found, keepAliveInterval remains the profile default
 
 			// Now perform the timeout check using the determined interval
 			if keepAliveInterval > 0 { // Only timeout if keep-alives are expected (interval > 0)

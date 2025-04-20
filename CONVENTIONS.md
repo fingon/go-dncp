@@ -1,6 +1,6 @@
-# Coding conventions (mainly for Aider use) #
+# Coding conventions for Go (mainly for Aider use) #
 
-- use 'self' as method receiver in Go methods
+- use 'self' as name of receiver in struct methods
 
 - fmt.Printf MUST NOT be used anywhere
 
@@ -25,3 +25,5 @@
 - if same value repeats multiple times in a code file, make it a constant
 
 - avoid writing comments about obvious actions, such as calling a function
+
+- do not comment import statements or test code
