@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/fingon/go-dncp"
+	"github.com/fingon/go-dncp" // Ensure dncp is imported
 	"github.com/fingon/go-dncp/timeish"
 	"github.com/fingon/go-dncp/trickle"
 )
@@ -48,11 +48,12 @@ func (t *URLTLV) EncodeValue() ([]byte, error) {
 	return []byte(t.URL), nil
 }
 
-// DecodeValue decodes the URL string from the value bytes.
+// DecodeValue decodes the URL string from the value bytes and returns consumed length.
 // The profile argument is ignored for this simple TLV type.
-func (t *URLTLV) DecodeValue(value []byte, _ *dncp.Profile) error {
+func (t *URLTLV) DecodeValue(value []byte, _ *dncp.Profile) (int, error) {
+	// Assume the entire value is the URL string. Sub-TLVs could follow.
 	t.URL = string(value)
-	return nil
+	return len(value), nil
 }
 
 // --- SHSP2 Profile ---

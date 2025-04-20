@@ -1,6 +1,7 @@
 package dncp
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -56,9 +57,9 @@ type TLVMarshaler interface {
 	// DecodeValue decodes the specific TLV's fields from the provided Value byte slice.
 	// The input slice contains only the Value part (no header or padding).
 	// The profile provides context like expected lengths.
-	DecodeValue(value []byte, profile *Profile) error
+	// Returns the number of bytes consumed from the value slice by this TLV's specific fields.
+	DecodeValue(value []byte, profile *Profile) (consumedBytes int, err error)
 	// GetSubTLVs returns any nested TLVs contained within this TLV.
-	// Returns nil if the TLV type does not support nesting or has no nested TLVs.
 	GetSubTLVs() []TLVMarshaler
 	// SetSubTLVs sets the nested TLVs for this TLV.
 	// Returns an error if the TLV type does not support nesting.
@@ -69,6 +70,7 @@ type TLVMarshaler interface {
 // It should be embedded in specific TLV structs.
 type BaseTLV struct {
 	TLVType TLVType
+	SubTLVs []TLVMarshaler // Holds any decoded sub-TLVs
 }
 
 // GetType returns the TLV type code.
@@ -76,14 +78,15 @@ func (b *BaseTLV) GetType() TLVType {
 	return b.TLVType
 }
 
-// GetSubTLVs provides a default implementation for TLVs that don't support nesting.
+// GetSubTLVs returns the decoded sub-TLVs.
 func (b *BaseTLV) GetSubTLVs() []TLVMarshaler {
-	return nil
+	return b.SubTLVs
 }
 
-// SetSubTLVs provides a default implementation for TLVs that don't support nesting.
-func (b *BaseTLV) SetSubTLVs(_ []TLVMarshaler) error {
-	return fmt.Errorf("TLV type %d does not support nested TLVs", b.TLVType)
+// SetSubTLVs sets the decoded sub-TLVs.
+func (b *BaseTLV) SetSubTLVs(subTLVs []TLVMarshaler) error {
+	b.SubTLVs = subTLVs
+	return nil
 }
 
 // --- TLV Registry ---
@@ -124,38 +127,56 @@ func newTLVInstance(tlvType TLVType) (TLVMarshaler, error) {
 // --- Generic Encoding/Decoding ---
 
 // Encode encodes a TLVMarshaler into the provided writer.
-// It handles the header, calls the specific EncodeValue method, and adds padding.
+// It handles the header, calls EncodeValue for specific fields, encodes SubTLVs, and adds padding.
 func Encode(tlv TLVMarshaler, w io.Writer) error {
-	valueBytes, err := tlv.EncodeValue()
+	// 1. Encode specific value fields
+	specificValueBytes, err := tlv.EncodeValue()
 	if err != nil {
-		return fmt.Errorf("failed to encode value for TLV type %d: %w", tlv.GetType(), err)
+		return fmt.Errorf("failed to encode specific value for TLV type %d: %w", tlv.GetType(), err)
 	}
 
-	valueLen := uint16(len(valueBytes))
-	if valueLen > MaxTLVValueLength {
-		return fmt.Errorf("%w: value length %d exceeds maximum %d for TLV type %d",
-			ErrInvalidTLVLength, valueLen, MaxTLVValueLength, tlv.GetType())
+	// 2. Encode SubTLVs if present
+	var subTLVBytes []byte
+	subTLVs := tlv.GetSubTLVs()
+	if len(subTLVs) > 0 {
+		var subBuf bytes.Buffer
+		for _, sub := range subTLVs {
+			if err := Encode(sub, &subBuf); err != nil { // Recursive call to handle sub-sub-TLVs etc.
+				return fmt.Errorf("failed to encode sub-TLV type %d for TLV type %d: %w", sub.GetType(), tlv.GetType(), err)
+			}
+		}
+		subTLVBytes = subBuf.Bytes()
 	}
 
-	// Calculate padding length
-	paddingLen := (4 - (int(valueLen) % 4)) % 4
+	// 3. Combine specific value and sub-TLVs
+	combinedValueBytes := make([]byte, 0, len(specificValueBytes)+len(subTLVBytes))
+	combinedValueBytes = append(combinedValueBytes, specificValueBytes...)
+	combinedValueBytes = append(combinedValueBytes, subTLVBytes...)
 
-	// Write Header
+	// 4. Calculate total length and padding
+	totalValueLen := uint16(len(combinedValueBytes))
+	if totalValueLen > MaxTLVValueLength {
+		return fmt.Errorf("%w: total value length %d (specific + sub-TLVs) exceeds maximum %d for TLV type %d",
+			ErrInvalidTLVLength, totalValueLen, MaxTLVValueLength, tlv.GetType())
+	}
+	paddingLen := (4 - (int(totalValueLen) % 4)) % 4
+
+	// 5. Write Header
 	header := make([]byte, TlvHeaderSize)
 	binary.BigEndian.PutUint16(header[0:2], uint16(tlv.GetType()))
-	binary.BigEndian.PutUint16(header[2:4], valueLen) // Length field is *value* length
+	binary.BigEndian.PutUint16(header[2:4], totalValueLen) // Length field is total value length
 	if _, err := w.Write(header); err != nil {
 		return fmt.Errorf("failed to write TLV header type %d: %w", tlv.GetType(), err)
 	}
 
-	// Write Value
-	if valueLen > 0 {
-		if _, err := w.Write(valueBytes); err != nil {
-			return fmt.Errorf("failed to write TLV value type %d: %w", tlv.GetType(), err)
+	// 6. Write Combined Value
+	if totalValueLen > 0 {
+		if _, err := w.Write(combinedValueBytes); err != nil {
+			return fmt.Errorf("failed to write TLV combined value type %d: %w", tlv.GetType(), err)
 		}
 	}
 
-	// Write Padding
+	// 7. Write Padding
 	if paddingLen > 0 {
 		padding := make([]byte, paddingLen) // Padding bytes are zero
 		if _, err := w.Write(padding); err != nil {
@@ -167,9 +188,9 @@ func Encode(tlv TLVMarshaler, w io.Writer) error {
 }
 
 // Decode decodes a single TLV from the provided reader using the registry.
-// It requires the DNCP profile to provide context (e.g., expected lengths) for decoding specific TLV types.
+// It requires the DNCP profile for context. Handles decoding of sub-TLVs if present.
 // Returns io.EOF if the reader is empty or contains insufficient data for a header.
-// Returns io.ErrUnexpectedEOF if the value or padding cannot be fully read.
+// Returns io.ErrUnexpectedEOF if the value, sub-TLVs, or padding cannot be fully read.
 func Decode(r io.Reader, profile *Profile) (TLVMarshaler, error) {
 	if profile == nil {
 		return nil, errors.New("decode requires a non-nil profile")
@@ -180,39 +201,42 @@ func Decode(r io.Reader, profile *Profile) (TLVMarshaler, error) {
 		if errors.Is(err, io.EOF) && nRead == 0 {
 			return nil, io.EOF // Clean EOF at the start
 		}
-		// Treat partial read or EOF after partial read as UnexpectedEOF
 		return nil, fmt.Errorf("failed to read TLV header (read %d bytes): %w", nRead, io.ErrUnexpectedEOF)
 	}
 
 	tlvType := TLVType(binary.BigEndian.Uint16(header[0:2]))
-	valueLen := binary.BigEndian.Uint16(header[2:4])
+	totalValueLen := binary.BigEndian.Uint16(header[2:4]) // This is the length of specific value + sub-TLVs
 
-	// Validate length
-	if valueLen > MaxTLVValueLength {
+	if totalValueLen > MaxTLVValueLength {
 		return nil, fmt.Errorf("%w: declared length %d exceeds maximum %d for TLV type %d",
-			ErrInvalidTLVLength, valueLen, MaxTLVValueLength, tlvType)
+			ErrInvalidTLVLength, totalValueLen, MaxTLVValueLength, tlvType)
 	}
 
 	// Create instance using registry
 	tlvInstance, err := newTLVInstance(tlvType)
 	if err != nil {
-		// Handle unknown type - skip or error? Error for now.
-		// To skip, we would read and discard valueLen + padding bytes.
+		// Read and discard the value and padding for unknown types before returning error
+		bytesToDiscard := int(totalValueLen) + (4-(int(totalValueLen)%4))%4
+		if bytesToDiscard > 0 {
+			if _, discardErr := io.CopyN(io.Discard, r, int64(bytesToDiscard)); discardErr != nil {
+				return nil, fmt.Errorf("failed to discard value/padding for unknown TLV type %d: %w (original error: %v)", tlvType, discardErr, err)
+			}
+		}
 		return nil, fmt.Errorf("cannot create instance for TLV type %d: %w", tlvType, err)
 	}
 
-	// Read value bytes
-	valueBytes := make([]byte, valueLen)
-	if valueLen > 0 {
-		nRead, err = io.ReadFull(r, valueBytes)
+	// Read the entire value section (specific fields + sub-TLVs)
+	fullValueBytes := make([]byte, totalValueLen)
+	if totalValueLen > 0 {
+		nRead, err = io.ReadFull(r, fullValueBytes)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read TLV value (type %d, expected %d, read %d): %w",
-				tlvType, valueLen, nRead, io.ErrUnexpectedEOF)
+			return nil, fmt.Errorf("failed to read TLV full value (type %d, expected %d, read %d): %w",
+				tlvType, totalValueLen, nRead, io.ErrUnexpectedEOF)
 		}
 	}
 
-	// Read and discard padding bytes
-	paddingLen := (4 - (int(valueLen) % 4)) % 4
+	// Read and discard padding bytes for the *total* value length
+	paddingLen := (4 - (int(totalValueLen) % 4)) % 4
 	if paddingLen > 0 {
 		paddingBuf := make([]byte, paddingLen)
 		nRead, err = io.ReadFull(r, paddingBuf)
@@ -220,12 +244,38 @@ func Decode(r io.Reader, profile *Profile) (TLVMarshaler, error) {
 			return nil, fmt.Errorf("failed to read TLV padding (type %d, expected %d, read %d): %w",
 				tlvType, paddingLen, nRead, io.ErrUnexpectedEOF)
 		}
-		// Could optionally check if padding bytes are zero here.
 	}
 
-	// Decode the value using the specific type's method, passing the profile
-	if err := tlvInstance.DecodeValue(valueBytes, profile); err != nil {
-		return nil, fmt.Errorf("failed to decode value for TLV type %d: %w", tlvType, err)
+	// Decode the specific fields using the type's method, passing the full value buffer
+	consumedBytes, err := tlvInstance.DecodeValue(fullValueBytes, profile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode specific value for TLV type %d: %w", tlvType, err)
+	}
+
+	// Check if bytes were consumed correctly
+	if consumedBytes < 0 || consumedBytes > int(totalValueLen) {
+		return nil, fmt.Errorf("invalid consumed bytes count %d returned by DecodeValue for TLV type %d (total value len %d)",
+			consumedBytes, tlvType, totalValueLen)
+	}
+
+	// Decode sub-TLVs if there are remaining bytes
+	if consumedBytes < int(totalValueLen) {
+		subTLVBytes := fullValueBytes[consumedBytes:]
+		subReader := bytes.NewReader(subTLVBytes)
+		decodedSubTLVs, err := DecodeAll(subReader, profile) // Recursive call
+		if err != nil && !errors.Is(err, io.EOF) {           // EOF is okay if DecodeAll reads everything
+			return nil, fmt.Errorf("failed to decode sub-TLVs for TLV type %d: %w", tlvType, err)
+		}
+		// Check if all sub-TLV bytes were consumed
+		if subReader.Len() > 0 {
+			return nil, fmt.Errorf("trailing data (%d bytes) after decoding sub-TLVs for TLV type %d", subReader.Len(), tlvType)
+		}
+		// Set the decoded sub-TLVs on the main TLV instance
+		if err := tlvInstance.SetSubTLVs(decodedSubTLVs); err != nil {
+			// This error might occur if the base SetSubTLVs wasn't overridden correctly,
+			// but the default BaseTLV implementation now handles it.
+			return nil, fmt.Errorf("failed to set sub-TLVs for TLV type %d: %w", tlvType, err)
+		}
 	}
 
 	return tlvInstance, nil

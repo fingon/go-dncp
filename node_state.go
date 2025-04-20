@@ -23,7 +23,8 @@ const (
 func decideNodeStateAction(localNodeState *NodeState, receivedNodeState *NodeStateTLV, exists bool, logger *slog.Logger) nodeStateAction {
 	if !exists {
 		logger.Info("Discovered new node via NodeState", "nodeID", fmt.Sprintf("%x", receivedNodeState.NodeID))
-		if len(receivedNodeState.NestedTLVs) == 0 { // Check if nested TLVs are present
+		// Use GetSubTLVs() which accesses BaseTLV.SubTLVs
+		if len(receivedNodeState.GetSubTLVs()) == 0 {
 			return actionUpdateStoreHeaderRequestData
 		}
 		return actionUpdateStoreData
@@ -36,14 +37,16 @@ func decideNodeStateAction(localNodeState *NodeState, receivedNodeState *NodeSta
 	case seqComparison > 0:
 		// Received state is newer
 		logger.Debug("Received newer NodeState", "nodeID", fmt.Sprintf("%x", receivedNodeState.NodeID), "rcvd_seq", receivedNodeState.SequenceNumber, "local_seq", localNodeState.SequenceNumber)
-		if len(receivedNodeState.NestedTLVs) == 0 {
+		// Use GetSubTLVs()
+		if len(receivedNodeState.GetSubTLVs()) == 0 {
 			return actionUpdateStoreHeaderRequestData
 		}
 		return actionUpdateStoreData
 	case seqComparison == 0 && !bytes.Equal(receivedNodeState.DataHash, localNodeState.DataHash):
 		// Same sequence number, different hash - potential inconsistency
 		logger.Warn("Received NodeState with same sequence but different hash", "nodeID", fmt.Sprintf("%x", receivedNodeState.NodeID), "seq", receivedNodeState.SequenceNumber)
-		if len(receivedNodeState.NestedTLVs) == 0 {
+		// Use GetSubTLVs()
+		if len(receivedNodeState.GetSubTLVs()) == 0 {
 			// We have data locally, they don't. Maybe just store header? Or request their (potentially empty) data?
 			// Let's store header and request their data to be sure.
 			return actionUpdateStoreHeaderRequestData
@@ -88,10 +91,10 @@ func (d *DNCP) storeNodeStateWithData(receivedNodeState *NodeStateTLV, now time.
 		Data:            make(NodeData),                                             // Initialize empty data map
 	}
 
-	// Group the already decoded nested TLVs by type
-	for _, nestedTLV := range receivedNodeState.NestedTLVs {
-		typ := nestedTLV.GetType()
-		newNodeState.Data[typ] = append(newNodeState.Data[typ], nestedTLV)
+	// Group the already decoded nested TLVs (now SubTLVs) by type
+	for _, subTLV := range receivedNodeState.GetSubTLVs() {
+		typ := subTLV.GetType()
+		newNodeState.Data[typ] = append(newNodeState.Data[typ], subTLV)
 	}
 
 	// Calculate hash of received data (using the already decoded TLVs)

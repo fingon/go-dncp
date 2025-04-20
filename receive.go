@@ -44,7 +44,7 @@ func (d *DNCP) processSingleTLV(tlv TLVMarshaler, senderNodeID NodeIdentifier, s
 		d.handleNetworkStateTLV(specificTLV, senderNodeID, sourceAddr)
 
 	case *NodeStateTLV:
-		d.logger.Debug("Received NodeState", "source", sourceAddr, "nodeID", fmt.Sprintf("%x", specificTLV.NodeID), "seq", specificTLV.SequenceNumber, "hasData", len(specificTLV.NestedTLVs) > 0)
+		d.logger.Debug("Received NodeState", "source", sourceAddr, "nodeID", fmt.Sprintf("%x", specificTLV.NodeID), "seq", specificTLV.SequenceNumber, "hasData", len(specificTLV.GetSubTLVs()) > 0)
 		// handleNodeStateTLV might return a collision error
 		if err := d.handleNodeStateTLV(specificTLV, sourceAddr); err != nil {
 			return err // Propagate collision error
